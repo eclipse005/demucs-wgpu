@@ -41,8 +41,12 @@ const WEIGHT_ARENA_BYTES: u64 = 1 << 30;
 /// The work arena's free lists are capped here. It bounds what the pool
 /// *retains* across chunks, not what one chunk allocates: recycling is what
 /// holds a chunk to its live set, and the cap only stops a long session with
-/// drifting shapes from accumulating. A 7.8 s chunk peaks near 0.9 GiB live.
-const WORK_ARENA_BYTES: u64 = 2 << 30;
+/// drifting shapes from accumulating. A 7.8 s chunk peaks near 1.1 GiB live;
+/// 1 GiB of idle unique sizes on top of that is what Task Manager reported as
+/// ~3.5 GiB committed. Large planes share buffers (see `REUSE_SIZE_RATIO`),
+/// so 1 GiB of retained free lists is enough for the scratch + softmax pair
+/// plus a cushion of medium activations.
+const WORK_ARENA_BYTES: u64 = 1 << 30;
 
 // --------------------------------------------------------------------- weights
 
@@ -649,9 +653,6 @@ impl GpuWeights {
 
 // ------------------------------------------------------------------ stage glue
 
-/// One convolution with its bias on a `(batch, c, h, w)` input. `batch` is the
-/// tensor's own leading axis — a batched forward carries several segments of
-/// the same shape through one pass.
 /// Grows `scratch` in place when `needed` elements would not fit.
 ///
 /// The gather's plane is `rows * k_pad * pitch` and every row's patches live
@@ -671,6 +672,143 @@ fn scratch_for(
     }
     *scratch = arena.alloc(gpu, (needed * 4) as u64, label)?;
     Ok(())
+}
+
+/// Elements of an im2col plane for `conv` on a `(batch, c, h, w)` (or
+/// `(batch, c, w)` with `h = 1`) input. Matches `conv_stage`.
+fn conv_plane_elems(batch: usize, h: usize, w: usize, conv: &GpuConv) -> usize {
+    let shape = Im2ColShape {
+        batch,
+        in_channels: conv.in_channels,
+        h,
+        w,
+        kernel: conv.kernel,
+        stride: conv.stride,
+        pad: conv.pad,
+    };
+    batch * pad_ceil(conv.k(), BK) * pad_ceil(shape.positions(), BN_C)
+}
+
+/// Largest im2col plane across a DConv's widened conv1 layers. Matches
+/// `dconv_stage`.
+fn dconv_plane_elems(rows: usize, time: usize, dconv: &GpuDConv) -> usize {
+    dconv
+        .layers
+        .iter()
+        .map(|layer| rows * pad_ceil(layer.conv1.k(), BK) * pad_ceil(time, BN_C))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Largest im2col / DConv plane the encoder stack will ask `scratch` to hold.
+fn encoder_scratch_elems(
+    batch: usize,
+    bins: usize,
+    frames: usize,
+    samples: usize,
+    encoder: &[GpuEnc],
+    tencoder: &[GpuEnc],
+) -> usize {
+    let mut max_elems = 0usize;
+    let mut freq = bins;
+    for layer in encoder {
+        max_elems = max_elems.max(conv_plane_elems(batch, freq, frames, &layer.conv));
+        let f_out = freq / 4;
+        max_elems = max_elems.max(dconv_plane_elems(batch * f_out, frames, &layer.dconv));
+        max_elems = max_elems.max(conv_plane_elems(batch, f_out, frames, &layer.rewrite));
+        freq = f_out;
+    }
+    let mut time = samples;
+    for layer in tencoder {
+        let padded = if time % 4 != 0 {
+            time + 4 - time % 4
+        } else {
+            time
+        };
+        max_elems = max_elems.max(conv_plane_elems(batch, 1, padded, &layer.conv));
+        let t_out = Im2ColShape {
+            batch,
+            in_channels: layer.conv.in_channels,
+            h: 1,
+            w: padded,
+            kernel: layer.conv.kernel,
+            stride: layer.conv.stride,
+            pad: layer.conv.pad,
+        }
+        .out_hw()
+        .1;
+        max_elems = max_elems.max(dconv_plane_elems(batch, t_out, &layer.dconv));
+        max_elems = max_elems.max(conv_plane_elems(batch, 1, t_out, &layer.rewrite));
+        time = t_out;
+    }
+    max_elems
+}
+
+/// Bottleneck spatial size and the per-layer time lengths the decoder crops
+/// to — the same values `run_encoder_stack` records in `EncoderStack`.
+fn bottleneck_shapes(
+    batch: usize,
+    bins: usize,
+    frames: usize,
+    samples: usize,
+    encoder: &[GpuEnc],
+    tencoder: &[GpuEnc],
+) -> (usize, usize, usize, Vec<usize>) {
+    let freq_h = bins / 4usize.pow(encoder.len() as u32);
+    let mut time = samples;
+    let mut lengths_t = Vec::with_capacity(tencoder.len());
+    for layer in tencoder {
+        lengths_t.push(time);
+        let padded = if time % 4 != 0 {
+            time + 4 - time % 4
+        } else {
+            time
+        };
+        time = Im2ColShape {
+            batch,
+            in_channels: layer.conv.in_channels,
+            h: 1,
+            w: padded,
+            kernel: layer.conv.kernel,
+            stride: layer.conv.stride,
+            pad: layer.conv.pad,
+        }
+        .out_hw()
+        .1;
+    }
+    (freq_h, frames, time, lengths_t)
+}
+
+/// Largest im2col / DConv plane the decoder stack will ask `scratch` to hold.
+fn decoder_scratch_elems(
+    batch: usize,
+    freq_h: usize,
+    freq_t: usize,
+    time_samples: usize,
+    lengths_t: &[usize],
+    decoder: &[GpuDec],
+    tdecoder: &[GpuDec],
+    stride: usize,
+) -> usize {
+    let mut max_elems = 0usize;
+    let mut f = freq_h;
+    let t = freq_t;
+    let mut samples = time_samples;
+    let depth = decoder.len();
+    for (index, (layer, layer_t)) in decoder.iter().zip(tdecoder.iter()).enumerate() {
+        max_elems = max_elems.max(conv_plane_elems(batch, f, t, &layer.rewrite));
+        max_elems = max_elems.max(dconv_plane_elems(batch * f, t, &layer.dconv));
+        let kh = layer.conv_tr.kernel.0;
+        let out_f = (f - 1) * stride + kh;
+        f = out_f - 2 * (kh / 4);
+        max_elems = max_elems.max(conv_plane_elems(batch, 1, samples, &layer_t.rewrite));
+        max_elems = max_elems.max(dconv_plane_elems(batch, samples, &layer_t.dconv));
+        samples = lengths_t
+            .get(depth - 1 - index)
+            .copied()
+            .unwrap_or(samples);
+    }
+    max_elems
 }
 
 /// One convolution with its bias on a `(batch, c, h, w)` input. `batch` is the
@@ -1507,10 +1645,22 @@ impl GpuHtdemucsRunner {
         let kernels = &self.kernels;
         let stride = self.config.stride;
         let batch = freq_dec_in.shape[0];
-        // Starts at the single-segment size and grows to the largest plane the
-        // decoder's shapes demand (see `scratch_for`); a batched forward's
-        // biggest is the last frequency rewrite's 3x3 patches.
-        let mut scratch = arena.alloc(gpu, ((128usize << 20) * 4) as u64, "dec.scratch")?;
+        // Sized to the largest plane this decoder will gather (decoder.3's 3×3
+        // rewrite at a 7.8 s segment is ~74 M elements / 297 MiB). `scratch_for`
+        // still grows if the estimate is short. The encoder's matching buffer
+        // is idle in the pool and, being within 4×, is reused here.
+        let scratch_elements = decoder_scratch_elems(
+            batch,
+            freq_dec_in.shape[2],
+            freq_dec_in.shape[3],
+            time_dec_in.shape[2],
+            &stack.lengths_t,
+            &self.weights.decoder,
+            &self.weights.tdecoder,
+            stride,
+        )
+        .max(1);
+        let mut scratch = arena.alloc(gpu, (scratch_elements * 4) as u64, "dec.scratch")?;
 
         let mut x = freq_dec_in;
         let mut xt = time_dec_in;
@@ -1982,18 +2132,38 @@ impl GpuHtdemucsRunner {
             "time.in",
         )?;
 
-        // im2col scratch. Sizing is per batch segment: the gather's plane is
-        // `rows * k_pad * pitch` and `rows` carries the batch (the frequency
-        // branch's rows are the bands, the waveform branch's are the segments).
-        // `scratch_for` grows this to whatever plane a batch needs and reports
-        // through the allocation itself, so a bigger batch or segment fails
-        // loudly rather than silently truncating. The dominant case is the
-        // waveform branch's DConv: its widened k=5 conv gathers 1920 patch rows
-        // over the whole time axis. That is the im2col tax the host path avoids
-        // with its direct convolution; the arena has room, and shrinking it is
-        // a later optimisation (a direct conv kernel, or conv2-style channel
-        // blocking).
-        let scratch_elements = 128 << 20;
+        // One scratch sized to the larger of the encoder and decoder planes
+        // (decoder.3's 3×3 rewrite is the global max, ~283 MiB at 7.8 s).
+        // Sharing the size means the pool keeps a single jumbo that also
+        // covers attention scores, instead of an 180 MiB encoder buffer and a
+        // 283 MiB decoder buffer both sitting idle and filling the cap.
+        let enc_elems = encoder_scratch_elems(
+            batch,
+            bins,
+            frames,
+            time.shape[2],
+            &self.weights.encoder,
+            &self.weights.tencoder,
+        );
+        let (bot_h, bot_t, bot_samples, lengths_t) = bottleneck_shapes(
+            batch,
+            bins,
+            frames,
+            time.shape[2],
+            &self.weights.encoder,
+            &self.weights.tencoder,
+        );
+        let dec_elems = decoder_scratch_elems(
+            batch,
+            bot_h,
+            bot_t,
+            bot_samples,
+            &lengths_t,
+            &self.weights.decoder,
+            &self.weights.tdecoder,
+            self.config.stride,
+        );
+        let scratch_elements = enc_elems.max(dec_elems).max(1);
         let mut scratch = arena.alloc(gpu, (scratch_elements * 4) as u64, "im2col.scratch")?;
 
         let mut saved_freq: Vec<DevTensor> = Vec::new();

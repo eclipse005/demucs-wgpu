@@ -250,10 +250,13 @@ const POOL_MIN_BYTES: u64 = 256 << 10;
 /// differ by a few hundred bytes.
 const CLASS_GRAIN_BYTES: u64 = 1 << 20;
 
-/// How many classes above the requested one [`Pool::take`] may reach before
-/// creating a buffer. Bounded so a small request cannot be served by, and
-/// strand, a huge buffer.
-const CLASS_SPAN: usize = 2;
+/// A free buffer may serve a request at most this many times smaller than
+/// itself. The old 2-class window was only 2 MiB of slack, so a 297 MiB im2col
+/// scratch sitting idle during the transformer could not cover a 220 MiB
+/// attention-score matrix — Task Manager then showed both, and they fought the
+/// pool cap. 4× covers that pair (and the smaller cross-attention scores)
+/// without letting a few-megabyte tensor strand the scratch.
+const REUSE_SIZE_RATIO: u64 = 4;
 
 fn class_of(size: u64) -> usize {
     size.div_ceil(CLASS_GRAIN_BYTES) as usize
@@ -277,32 +280,46 @@ impl Pool {
     }
 
     /// Takes a buffer of at least `size` bytes out of the free lists, or
-    /// `None` if no class within [`CLASS_SPAN`] has one on offer. Returns the
-    /// buffer with its real size, which may exceed the request.
+    /// `None` if nothing within [`REUSE_SIZE_RATIO`] of the request is free.
+    /// Returns the buffer with its real size, which may exceed the request.
     ///
-    /// The class is only a coarse filter, not a guarantee: a 512 KiB+1 buffer
-    /// and a 1 MiB one land in the same class, so a hit still has to be checked
-    /// against the exact size on record. Skipping the check would hand out a
-    /// buffer too small for its bindings, which wgpu rejects at submit time as
-    /// an invalid bind group — with no hint of which allocation was at fault.
+    /// Best-fit among buffers in `[size, size * 4]`: the class is only a
+    /// coarse filter, not a guarantee. A 512 KiB+1 buffer and a 1 MiB one land
+    /// in the same class, so a hit still has to be checked against the exact
+    /// size on record. Skipping the check would hand out a buffer too small
+    /// for its bindings, which wgpu rejects at submit time as an invalid bind
+    /// group — with no hint of which allocation was at fault.
     fn take(&self, size: u64) -> Option<(u64, wgpu::Buffer)> {
         let start = class_of(size);
+        let max_size = size.saturating_mul(REUSE_SIZE_RATIO);
         let mut free = self.free.borrow_mut();
-        let end = free.len().min(start + CLASS_SPAN);
-        for class in start..end {
-            if let Some(index) = free[class].iter().position(|(buffer_size, _)| *buffer_size >= size) {
-                let (buffer_size, buffer) = free[class].remove(index);
-                self.pooled_bytes.set(self.pooled_bytes.get() - buffer_size);
-                self.reused.set(self.reused.get() + 1);
-                return Some((buffer_size, buffer));
+        let mut best: Option<(usize, usize)> = None;
+        let mut best_size = u64::MAX;
+        for class in start..free.len() {
+            for (index, (buffer_size, _)) in free[class].iter().enumerate() {
+                if *buffer_size >= size && *buffer_size <= max_size && *buffer_size < best_size {
+                    best = Some((class, index));
+                    best_size = *buffer_size;
+                }
             }
         }
-        None
+        let (class, index) = best?;
+        let (buffer_size, buffer) = free[class].remove(index);
+        self.pooled_bytes.set(self.pooled_bytes.get() - buffer_size);
+        self.reused.set(self.reused.get() + 1);
+        Some((buffer_size, buffer))
     }
 
-    /// Returns a buffer to its size class — unless that would exceed the cap,
-    /// in which case the buffer is dropped instead.
+    /// Returns a buffer to its size class. If that would exceed the cap,
+    /// smaller idle buffers are dropped first so a large, reused plane (the
+    /// im2col scratch, attention scores) is not evicted by a pile of leftover
+    /// unique sizes. If the buffer still does not fit — it is larger than the
+    /// cap, or the pool is already full of same-or-larger buffers — it is
+    /// dropped instead of retained.
     fn give_back(&self, size: u64, buffer: wgpu::Buffer) {
+        if self.pooled_bytes.get() + size > self.cap {
+            self.evict_smaller_to_fit(size);
+        }
         if self.pooled_bytes.get() + size > self.cap {
             return;
         }
@@ -313,6 +330,39 @@ impl Pool {
         }
         self.pooled_bytes.set(self.pooled_bytes.get() + size);
         free[class].push((size, buffer));
+    }
+
+    /// Drops the smallest idle buffers until `needed` would fit under the cap,
+    /// but never a buffer as large as `needed` itself — swapping a 300 MiB
+    /// scratch for another 300 MiB one is a wash, and dropping it for a
+    /// smaller newcomer is how the cap used to churn 1 GiB every layer.
+    fn evict_smaller_to_fit(&self, needed: u64) {
+        loop {
+            if self.pooled_bytes.get() + needed <= self.cap {
+                return;
+            }
+            let mut free = self.free.borrow_mut();
+            let mut smallest: Option<(usize, usize, u64)> = None;
+            for (class, bucket) in free.iter().enumerate() {
+                for (index, (buffer_size, _)) in bucket.iter().enumerate() {
+                    let take = match smallest {
+                        None => true,
+                        Some((_, _, size)) => *buffer_size < size,
+                    };
+                    if take {
+                        smallest = Some((class, index, *buffer_size));
+                    }
+                }
+            }
+            match smallest {
+                Some((class, index, buffer_size)) if buffer_size < needed => {
+                    drop(free[class].remove(index));
+                    self.pooled_bytes
+                        .set(self.pooled_bytes.get() - buffer_size);
+                }
+                _ => return,
+            }
+        }
     }
 
     /// Records an allocation entering the live set.
