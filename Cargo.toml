@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/demucs-core", "crates/demucs-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ndarray = { version = "0.16", features = ["rayon"] }
+rustfft = "6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+wgpu = "30"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

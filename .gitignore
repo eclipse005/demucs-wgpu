@@ -1,0 +1,23 @@
+# Build
+/target
+
+# Regenerable reference dumps (tools/dump_demucs.py, --dump-trace)
+/bench/ref_dump/
+/bench/rust_dump/
+
+# Generated separation outputs
+/bench/rust_clip*/
+/bench/rust_full/
+/bench/rust_dump/
+
+# Large audio fixtures: regenerate with tools/demucs_reference.py / demucs_rtfx.py
+# (bench/clip*.wav are excerpts of a local reference track)
+/bench/*.wav
+
+# Measurement logs (keep the scripts, not the runs)
+/bench/*.txt
+/bench/*.csv
+
+# Python
+__pycache__/
+*.pyc
