@@ -310,6 +310,10 @@ pub struct Kernels {
     gemm_batched: wgpu::ComputePipeline,
     /// The batched form with B read as `(n, k)`, which is what `Q @ K^T` needs.
     gemm_transb: wgpu::ComputePipeline,
+    /// `gemm_f32_transb(false)`: same addressing, batch bases compiled out.
+    /// Linear projections are `batches == 1` and the dead offsets cost ~15% on
+    /// this driver. QK^T stays on [`Self::gemm_transb`].
+    gemm_transb_plain: wgpu::ComputePipeline,
     /// The 64x128 tile, unbatched: an option for the convolutions, whose output
     /// channel counts are far below a 128-row tile.
     gemm_bm64: wgpu::ComputePipeline,
@@ -379,9 +383,12 @@ pub struct Kernels {
     col2im: wgpu::ComputePipeline,
     group_norm: wgpu::ComputePipeline,
     /// The split form of `group_norm`, for slices too big for one workgroup:
-    /// a per-segment reduce, then a combine-and-apply.
+    /// a per-segment reduce, a per-pair stats fold, then apply.
     group_norm_partial: wgpu::ComputePipeline,
+    group_norm_combine: wgpu::ComputePipeline,
     group_norm_apply: wgpu::ComputePipeline,
+    /// Original apply: every lane re-sums the pair's partials. A/B only.
+    group_norm_apply_from_partials: wgpu::ComputePipeline,
     lstm_recur: wgpu::ComputePipeline,
     /// The register-resident variant, compiled per hidden width: its workgroup
     /// size is `8 * hidden`, so one pipeline cannot serve two layer widths.
@@ -427,6 +434,11 @@ impl Kernels {
             gemm_transb: gpu.pipeline(
                 "gemm_f32_transb",
                 &shaders::gemm_f32_transb(true),
+                "gemm",
+            )?,
+            gemm_transb_plain: gpu.pipeline(
+                "gemm_f32_transb_plain",
+                &shaders::gemm_f32_transb(false),
                 "gemm",
             )?,
             gemm_bm64: gpu.pipeline("gemm_f32_bm64", &shaders::gemm_bm64(), "gemm")?,
@@ -548,9 +560,19 @@ impl Kernels {
                 &shaders::group_norm_partial(),
                 "group_norm_partial",
             )?,
+            group_norm_combine: gpu.pipeline(
+                "group_norm_combine",
+                &shaders::group_norm_combine(),
+                "group_norm_combine",
+            )?,
             group_norm_apply: gpu.pipeline(
                 "group_norm_apply",
                 &shaders::group_norm_apply(),
+                "group_norm_apply",
+            )?,
+            group_norm_apply_from_partials: gpu.pipeline(
+                "group_norm_apply_from_partials",
+                &shaders::group_norm_apply_from_partials(),
                 "group_norm_apply",
             )?,
             lstm_recur: gpu.pipeline("lstm_recur", &shaders::lstm_recur(), "lstm_recur")?,
@@ -969,6 +991,9 @@ impl Kernels {
             (false, false, true) => (&self.gemm_batched_bn64, "gemm_batched_bn64", n64),
             (true, false, _) => (&self.gemm, "gemm", square),
             (false, false, false) => (&self.gemm_batched, "gemm_batched", square),
+            (true, true, false) if shaders::transb_plain_for_single_batch() => {
+                (&self.gemm_transb_plain, "gemm_transb", square)
+            }
             (_, true, false) => (&self.gemm_transb, "gemm_transb", square),
         };
         let grid = job.grid_with(tile.0, tile.1);
@@ -1773,10 +1798,10 @@ impl Kernels {
         // A slice larger than the single-workgroup form can walk in the time it
         // takes to launch it — the waveform DConv's `(1, 96, 85995)` measured
         // 23.7 ms as one workgroup against the host's sub-millisecond for the
-        // same statistics — is cut into segments, one workgroup each, in two
-        // dispatches. The single-workgroup form stays for the DConv's few-
-        // hundred-element slices, where a second pass would cost more than the
-        // first.
+        // same statistics — is cut into segments, one workgroup each, then a
+        // per-pair stats fold and an apply. The single-workgroup form stays for
+        // the DConv's few-hundred-element slices, where extra passes would cost
+        // more than the first.
         let group_size = shape.per_group * shape.len;
         let segments = group_size.div_ceil(GROUP_NORM_SEGMENT_ELEMENTS).max(1);
         if segments > 1 {
@@ -1805,21 +1830,6 @@ impl Kernels {
                     (&partials.buffer, partials.offset, (partials.len() * 4) as u64),
                 ],
             );
-            let group_apply = bind_group(
-                gpu,
-                "group_norm_apply",
-                &self.group_norm_apply.get_bind_group_layout(0),
-                &[
-                    (&x.buffer, x.offset, (x.len() * 4) as u64),
-                    (&gamma.buffer, gamma.offset, (gamma.len() * 4) as u64),
-                    (&beta.buffer, beta.offset, (beta.len() * 4) as u64),
-                    (&out.buffer, out.offset, (out.len() * 4) as u64),
-                    (&gd.buffer, gd.offset, 16),
-                    (&ge.buffer, ge.offset, 16),
-                    (&gs.buffer, gs.offset, 16),
-                    (&partials.buffer, partials.offset, (partials.len() * 4) as u64),
-                ],
-            );
             let workgroups = pairs * segments;
             if workgroups.div_ceil(shaders::ROW_GRID_X) > shaders::ROW_GRID_X as usize {
                 return Err(Error::Shape(format!(
@@ -1833,12 +1843,73 @@ impl Kernels {
                 &group_partial,
                 (gx, gy, 1),
             );
-            recorder.dispatch(
-                "group_norm_apply",
-                &self.group_norm_apply,
-                &group_apply,
-                (gx, gy, 1),
-            );
+            if shaders::group_norm_combine_stats() {
+                // Two floats per pair: mean and the already-formed scale.
+                let stats = arena.alloc(gpu, (2 * pairs * 4) as u64, "group_norm.stats")?;
+                let group_combine = bind_group(
+                    gpu,
+                    "group_norm_combine",
+                    &self.group_norm_combine.get_bind_group_layout(0),
+                    &[
+                        (&partials.buffer, partials.offset, (partials.len() * 4) as u64),
+                        (&stats.buffer, stats.offset, (stats.len() * 4) as u64),
+                        (&gd.buffer, gd.offset, 16),
+                        (&ge.buffer, ge.offset, 16),
+                        (&gs.buffer, gs.offset, 16),
+                    ],
+                );
+                let group_apply = bind_group(
+                    gpu,
+                    "group_norm_apply",
+                    &self.group_norm_apply.get_bind_group_layout(0),
+                    &[
+                        (&x.buffer, x.offset, (x.len() * 4) as u64),
+                        (&gamma.buffer, gamma.offset, (gamma.len() * 4) as u64),
+                        (&beta.buffer, beta.offset, (beta.len() * 4) as u64),
+                        (&out.buffer, out.offset, (out.len() * 4) as u64),
+                        (&gd.buffer, gd.offset, 16),
+                        (&ge.buffer, ge.offset, 16),
+                        (&gs.buffer, gs.offset, 16),
+                        (&stats.buffer, stats.offset, (stats.len() * 4) as u64),
+                    ],
+                );
+                let combine_wgs = pairs.div_ceil(ROW_THREADS);
+                let (cx, cy) = row_grid(combine_wgs);
+                recorder.dispatch(
+                    "group_norm_combine",
+                    &self.group_norm_combine,
+                    &group_combine,
+                    (cx, cy, 1),
+                );
+                recorder.dispatch(
+                    "group_norm_apply",
+                    &self.group_norm_apply,
+                    &group_apply,
+                    (gx, gy, 1),
+                );
+            } else {
+                let group_apply = bind_group(
+                    gpu,
+                    "group_norm_apply",
+                    &self.group_norm_apply_from_partials.get_bind_group_layout(0),
+                    &[
+                        (&x.buffer, x.offset, (x.len() * 4) as u64),
+                        (&gamma.buffer, gamma.offset, (gamma.len() * 4) as u64),
+                        (&beta.buffer, beta.offset, (beta.len() * 4) as u64),
+                        (&out.buffer, out.offset, (out.len() * 4) as u64),
+                        (&gd.buffer, gd.offset, 16),
+                        (&ge.buffer, ge.offset, 16),
+                        (&gs.buffer, gs.offset, 16),
+                        (&partials.buffer, partials.offset, (partials.len() * 4) as u64),
+                    ],
+                );
+                recorder.dispatch(
+                    "group_norm_apply",
+                    &self.group_norm_apply_from_partials,
+                    &group_apply,
+                    (gx, gy, 1),
+                );
+            }
             return Ok(());
         }
         let group = bind_group(

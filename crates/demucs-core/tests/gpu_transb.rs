@@ -129,3 +129,67 @@ fn transposed_batched_gemm_matches_the_reference() {
     }
     assert!(comparison.rms_relative_error() < 1e-5);
 }
+
+/// Linear projections are `transb` with `batches == 1`. They used to share the
+/// batched shader (dead `abase`/`bbase`/`cbase`); this pins the unbatched
+/// variant against the same reference.
+#[test]
+fn single_batch_transb_matches_the_reference() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let kernels = Kernels::new(&gpu).unwrap();
+    let mut arena = Arena::new(&gpu, 64 << 20);
+
+    // Crosses the 128 tile on both axes; k = 64 is a Linear / QK^T head width.
+    let m = 192usize;
+    let n = 160usize;
+    let k = 64usize;
+    let a_host = fill(m * k, 4);
+    let b_host = fill(n * k, 5);
+    let a = arena.upload(&gpu, &[m, k], &a_host, "a").unwrap();
+    let b = arena.upload(&gpu, &[n, k], &b_host, "b").unwrap();
+    let c = arena.tensor(&gpu, &[m, n], "c").unwrap();
+
+    let job = GemmJob {
+        m,
+        n,
+        k,
+        lda: k,
+        ldb: k,
+        ldc: n,
+        batches: 1,
+        inner_count: 1,
+        a_outer: 0,
+        a_inner: 0,
+        b_outer: 0,
+        b_inner: 0,
+        c_outer: 0,
+        c_inner: 0,
+        transb: true,
+    };
+    let mut recorder = Recorder::new(&gpu);
+    kernels
+        .gemm_into(&gpu, &mut arena, &mut recorder, &a, &b, &c, job)
+        .unwrap();
+    recorder.submit(&gpu).unwrap();
+
+    let mut expected = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += a_host[i * k + p] * b_host[j * k + p];
+            }
+            expected[i * n + j] = acc;
+        }
+    }
+    let actual = read(&gpu, &c);
+    let comparison = compare(&expected, &actual).unwrap();
+    println!(
+        "single-batch transb {m}x{n}x{k}: rms_relative={:.3e} max_abs={:.3e}",
+        comparison.rms_relative_error(),
+        comparison.max_abs
+    );
+    assert!(comparison.rms_relative_error() < 1e-5);
+}

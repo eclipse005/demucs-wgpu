@@ -121,15 +121,24 @@ fn check(
     kernels
         .group_norm_into(gpu, arena, &mut recorder, &x, &gamma, &beta, &out, shape)
         .unwrap();
-    // One dispatch for a slice one workgroup can walk; two (a per-segment
-    // reduce, then a combine-and-apply) once the slice is cut into segments.
+    // One dispatch for a slice one workgroup can walk; three (per-segment
+    // reduce, per-pair stats, apply) once the slice is cut into segments.
+    // `DEMUCS_GN_COMBINE=0` drops the stats pass and the apply re-sums.
     let split = shape.per_group * shape.len > 4096;
+    let combine = demucs_core::gpu::shaders::group_norm_combine_stats();
+    let want = if !split {
+        1
+    } else if combine {
+        3
+    } else {
+        2
+    };
     assert_eq!(
         recorder.dispatches(),
-        if split { 2 } else { 1 },
+        want,
         "a slice of {} elements splits into segments: {} dispatches",
         shape.per_group * shape.len,
-        if split { 2 } else { 1 },
+        want,
     );
     recorder.submit(gpu).unwrap();
 

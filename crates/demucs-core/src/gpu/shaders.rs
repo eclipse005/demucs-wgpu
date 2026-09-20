@@ -81,6 +81,28 @@ pub fn coalesced_b_for_convs() -> bool {
     std::env::var("DEMUCS_GEMM_B_WALK").map(|v| v == "coalesced").unwrap_or(false)
 }
 
+/// Whether a single-batch `transb` GEMM uses the shader with batch bases compiled
+/// out. HTDemucs Linear projections are `batches == 1` but historically shared
+/// the batched `gemm_transb` (the QK^T path); carrying dead `abase`/`bbase`/
+/// `cbase` through the K loop cost 15% on this driver for the plain GEMM
+/// (3.27 TFLOP/s without vs 2.76 with). `DEMUCS_GEMM_TRANSB_PLAIN=0` restores
+/// the batched shader for A/B. Neutral on HTDemucs Linear shapes.
+pub fn transb_plain_for_single_batch() -> bool {
+    std::env::var("DEMUCS_GEMM_TRANSB_PLAIN")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Whether the split `group_norm` reduces per-slice stats once, then applies.
+/// The original apply had every thread of every segment workgroup walk all
+/// `segments` partials — O(segments²) on the waveform DConv's 2016-segment
+/// slices, ~8 ms × 4. `DEMUCS_GN_COMBINE=0` restores that loop for A/B.
+pub fn group_norm_combine_stats() -> bool {
+    std::env::var("DEMUCS_GN_COMBINE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 /// Whether the convolution's narrow-M tile is used. `DEMUCS_CONV_TILE=128` restores
 /// the square tile, which is how the two were compared.
 pub fn bm64_for_convs() -> bool {
@@ -782,10 +804,13 @@ fn gemm(
 {prefetch}        }}
 
 {compute}
-        workgroupBarrier();
-
-        // Everybody is done reading the current stage, so it can be replaced.
-{store_prefetch}        workgroupBarrier();
+        // The last K block has nothing to prefetch-store; skipping the pair of
+        // barriers here is bit-identical (epilogue reads registers, not shared).
+        // Uniform over the workgroup: k1 and gd.k do not vary by lane.
+        if (k1 < gd.k) {{
+            workgroupBarrier();
+{store_prefetch}            workgroupBarrier();
+        }}
     }}
 
 {epilogue}
@@ -2600,9 +2625,115 @@ fn group_norm_partial(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invo
     )
 }
 
-/// The second dispatch of the split `group_norm`: combine this slice's
-/// `segments` partials and normalise this workgroup's block with the result.
+/// One thread per `(row, group)`: fold that pair's `segments` partials into
+/// `(mean, scale)` with the same left-to-right sum the apply kernel used to
+/// replay in every lane of every segment workgroup.
+pub fn group_norm_combine() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> Partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Stats: array<f32>;
+@group(0) @binding(2) var<uniform> gd: vec4<u32>;
+@group(0) @binding(3) var<uniform> ge: vec4<u32>;
+@group(0) @binding(4) var<uniform> gf: vec4<u32>;  // segments, segment_len, _, _
+
+const THREADS: u32 = {threads}u;
+const ROW_GRID_X: u32 = {grid_x}u;
+
+@compute @workgroup_size({threads})
+fn group_norm_combine(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let segments = gf.x;
+    let pair = (wid.x + wid.y * ROW_GRID_X) * THREADS + lid.x;
+    let rows = ge.x;
+    let groups = gd.x;
+    if (pair >= rows * groups) {{ return; }}
+
+    let per_group = gd.y;
+    let len = gd.z;
+    let eps = bitcast<f32>(ge.w);
+    let group_size = per_group * len;
+
+    var sum = 0.0;
+    var sum_sq = 0.0;
+    let first = pair * segments * 2u;
+    for (var s = 0u; s < segments; s = s + 1u) {{
+        sum = sum + Partials[first + s * 2u];
+        sum_sq = sum_sq + Partials[first + s * 2u + 1u];
+    }}
+    let n = f32(group_size);
+    let mean = sum / n;
+    let variance = max(sum_sq / n - mean * mean, 0.0);
+    Stats[pair * 2u] = mean;
+    Stats[pair * 2u + 1u] = 1.0 / sqrt(variance + eps);
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X
+    )
+}
+
+/// Apply using per-pair `(mean, scale)` from [`group_norm_combine`].
 pub fn group_norm_apply() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> Gamma: array<f32>;
+@group(0) @binding(2) var<storage, read> Beta: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<uniform> gd: vec4<u32>;
+@group(0) @binding(5) var<uniform> ge: vec4<u32>;
+@group(0) @binding(6) var<uniform> gf: vec4<u32>;
+@group(0) @binding(7) var<storage, read> Stats: array<f32>;
+
+const THREADS: u32 = {threads}u;
+const ROW_GRID_X: u32 = {grid_x}u;
+
+fn group_norm_index(local: u32, len: u32, len_stride: u32, channel_stride: u32) -> u32 {{
+    return (local / len) * channel_stride + (local % len) * len_stride;
+}}
+
+@compute @workgroup_size({threads})
+fn group_norm_apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let segments = gf.x;
+    let segment_len = gf.y;
+    let work = wid.x + wid.y * ROW_GRID_X;
+    let pair = work / segments;
+    let segment = work % segments;
+
+    let rows = ge.x;
+    let groups = gd.x;
+    if (pair >= rows * groups) {{ return; }}
+    let row = pair / groups;
+    let group = pair % groups;
+
+    let per_group = gd.y;
+    let len = gd.z;
+    let row_stride = gd.w;
+    let len_stride = ge.y;
+    let channel_stride = ge.z;
+
+    let group_size = per_group * len;
+    let base = row * row_stride + group * per_group * channel_stride;
+    let mean = Stats[pair * 2u];
+    let scale = Stats[pair * 2u + 1u];
+
+    let start = segment * segment_len;
+    let end = min(start + segment_len, group_size);
+    for (var local = start + lid.x; local < end; local = local + THREADS) {{
+        let offset = base + group_norm_index(local, len, len_stride, channel_stride);
+        let channel = group * per_group + local / len;
+        Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+    }}
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X
+    )
+}
+
+/// The original apply: every lane of every segment workgroup re-sums the
+/// pair's partials. Kept so `DEMUCS_GN_COMBINE=0` can A/B the combine pass.
+pub fn group_norm_apply_from_partials() -> String {
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> X: array<f32>;
@@ -2645,8 +2776,6 @@ fn group_norm_apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
     let group_size = per_group * len;
     let base = row * row_stride + group * per_group * channel_stride;
 
-    // The slice's statistics: `segments` f32 pairs this dispatch's ordering
-    // guarantees are already written.
     var sum = 0.0;
     var sum_sq = 0.0;
     let first = pair * segments * 2u;
