@@ -3020,6 +3020,193 @@ fn heads_permute(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     )
 }
 
+/// 4096-point unnormalised inverse FFT of a one-sided Hermitian spectrum.
+///
+/// One workgroup per frame. HTDemucs rejects `nfft != 4096`, so the size is
+/// compiled in: 4096 `vec2` of shared memory is 32 KiB, which this card's
+/// adapter limits already grant (`request_device` copies the adapter's limits).
+///
+/// `X` is CaC-packed `(batch, 4*sources, nfft/2, frames)`. The Nyquist bin is
+/// the zero `pad_for_ispec` would have added. Inverse twiddles are `exp(+2πi…)`,
+/// matching rustfft; the store applies `window / sqrt(nfft)`, which is the
+/// host's `normalized=True` inverse scale times the Hann window.
+pub fn istft_irfft4096() -> String {
+    r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> Win: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // frames, bins, packed, batch
+
+const N: u32 = 4096u;
+const BITS: u32 = 12u;
+const THREADS: u32 = 256u;
+const PER: u32 = 16u;
+const PI2: f32 = 6.283185307179586;
+
+var<workgroup> sm: array<vec2<f32>, 4096>;
+
+fn bitrev12(x: u32) -> u32 {
+    return reverseBits(x) >> (32u - BITS);
+}
+
+@compute @workgroup_size(256)
+fn istft_irfft4096(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let frames = gd.x;
+    let bins = gd.y;
+    let packed = gd.z;
+    let frame = wid.x;
+    let row = wid.y;
+    if (frame >= frames) { return; }
+
+    let packed_out = packed / 2u;
+    let b = row / packed_out;
+    let co = row % packed_out;
+    let cpack = co * 2u;
+    let spec_base = (b * packed + cpack) * bins * frames + frame;
+    let spec_im = spec_base + bins * frames;
+
+    for (var p = 0u; p < PER; p++) {
+        let k = lid.x + p * THREADS;
+        var z = vec2<f32>(0.0, 0.0);
+        if (k == 0u) {
+            z = vec2(X[spec_base], X[spec_im]);
+        } else if (k < bins) {
+            let re = X[spec_base + k * frames];
+            let im = X[spec_im + k * frames];
+            z = vec2(re, im);
+        } else if (k > bins) {
+            let m = N - k;
+            let re = X[spec_base + m * frames];
+            let im = X[spec_im + m * frames];
+            z = vec2(re, -im);
+        }
+        sm[bitrev12(k)] = z;
+    }
+    workgroupBarrier();
+
+    for (var stage = 0u; stage < BITS; stage++) {
+        let m = 1u << (stage + 1u);
+        let mh = m >> 1u;
+        workgroupBarrier();
+        for (var p = 0u; p < 8u; p++) {
+            let bfly = lid.x + p * THREADS;
+            let j = bfly % mh;
+            let grp = bfly / mh;
+            let idx = grp * m + j;
+            let pair = idx + mh;
+            let a = sm[idx];
+            let bval = sm[pair];
+            let angle = PI2 * f32(j) / f32(m);
+            let wr = cos(angle);
+            let wi = sin(angle);
+            let t = vec2(bval.x * wr - bval.y * wi, bval.x * wi + bval.y * wr);
+            sm[idx] = a + t;
+            sm[pair] = a - t;
+        }
+    }
+    workgroupBarrier();
+
+    let inv = 0.015625; // 1/sqrt(4096)
+    let dst = ((row * frames + frame) * N);
+    for (var p = 0u; p < PER; p++) {
+        let i = lid.x + p * THREADS;
+        Out[dst + i] = sm[i].x * Win[i] * inv;
+    }
+}
+"#
+    .to_string()
+}
+
+/// Overlap-add of windowed iFFT frames onto `length` samples, then divide by
+/// the Hann envelope. Frame `f` lands at offset `(f+2)*hop` because `_ispec`
+/// pads two zero frames on the left; those frames are skipped (they are zero).
+pub fn istft_ola() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> Frames: array<f32>;
+@group(0) @binding(1) var<storage, read> Win: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // frames, hop, nfft, pad
+@group(0) @binding(4) var<uniform> ge: vec4<u32>;  // length, packed_out, batch, _
+
+const THREADS: u32 = {threads}u;
+const GRID_X: u32 = {grid_x}u;
+
+@compute @workgroup_size({threads})
+fn istft_ola(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let i = (wid.y * GRID_X + wid.x) * THREADS + lid.x;
+    let frames = gd.x;
+    let hop = gd.y;
+    let nfft = gd.z;
+    let pad = gd.w;
+    let length = ge.x;
+    let packed_out = ge.y;
+    let total = ge.z * packed_out * length;
+    if (i >= total) {{ return; }}
+
+    let sample = i % length;
+    let row = i / length;
+    let ola_idx = sample + (nfft / 2u) + pad;
+    let nfft_i = i32(nfft);
+    let hop_i = i32(hop);
+    let ola_i = i32(ola_idx);
+    let pf_hi = ola_idx / hop;
+    var pf_lo = 0u;
+    if (ola_idx + hop > nfft) {{
+        pf_lo = (ola_idx + hop - nfft) / hop;
+    }}
+    let padded_frames = frames + 4u;
+
+    var acc = 0.0;
+    var env = 0.0;
+    for (var pf = pf_lo; pf <= pf_hi; pf++) {{
+        if (pf >= padded_frames) {{ continue; }}
+        let local_i = ola_i - i32(pf) * hop_i;
+        if (local_i < 0 || local_i >= nfft_i) {{ continue; }}
+        let local = u32(local_i);
+        let w = Win[local];
+        env += w * w;
+        if (pf >= 2u && pf < 2u + frames) {{
+            acc += Frames[(row * frames + (pf - 2u)) * nfft + local];
+        }}
+    }}
+    Out[i] = select(0.0, acc / env, env > 0.0);
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X,
+    )
+}
+
+/// `x[i] = x[i] * scale[i / plane] + shift[i / plane]`, in place.
+///
+/// The HTDemucs epilogue denormalises a whole branch with one mean/std per
+/// batch item, which is not a channel affine.
+pub fn batch_affine_in_place() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(1) var<storage, read> Scale: array<f32>;
+@group(0) @binding(2) var<storage, read> Shift: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // count, plane, _, _
+
+const THREADS: u32 = {threads}u;
+const GRID_X: u32 = {grid_x}u;
+
+@compute @workgroup_size({threads})
+fn batch_affine_in_place(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let i = (wid.y * GRID_X + wid.x) * THREADS + lid.x;
+    if (i >= gd.x) {{ return; }}
+    let plane = gd.y;
+    let b = i / plane;
+    Out[i] = Out[i] * Scale[b] + Shift[b];
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

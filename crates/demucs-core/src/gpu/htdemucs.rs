@@ -7,9 +7,9 @@
 //! every traced stage by name — so each further stage can be moved over and
 //! checked independently of everything after it.
 //!
-//! Split of work, as in the two prior ports: `torch.stft` / `torch.istft` and
-//! the complex packing stay on the host (2.5 % of the reference's time, already
-//! exact); one `Recorder` builds the whole device graph and submits it once.
+//! Split of work: `torch.stft` stays on the host; the inverse STFT, CaC unpack
+//! and branch sum run on the device so a chunk only reads back the waveforms.
+//! One `Recorder` builds the whole device graph and submits it once.
 //!
 //! **Weights come from the host model**, which is the architecture description
 //! already aligned against PyTorch, so this file cannot disagree with it about
@@ -1827,6 +1827,73 @@ impl GpuHtdemucsRunner {
         Ok((freq_read, time_read))
     }
 
+    /// Encoder through decoder plus the CaC iSTFT epilogue, still one submit.
+    ///
+    /// Only the summed waveforms come back: `(batch, sources, channels, length)`.
+    fn forward_stems(
+        &self,
+        freq_mag: &Array4<f32>,
+        wave: &Array3<f32>,
+        mean: &[f32],
+        std: &[f32],
+        mean_t: &[f32],
+        std_t: &[f32],
+        sources: usize,
+        length: usize,
+        trace: &mut dyn TraceSink,
+    ) -> Result<Array4<f32>> {
+        let gpu = &self.gpu;
+        let mut recorder = Recorder::new(gpu);
+        let (freq_dev, time_dev, stack) =
+            self.run_to_decoder_inputs(freq_mag, wave, &mut recorder, trace)?;
+        let (freq_out, time_out) =
+            self.run_decoders(freq_dev, time_dev, stack, &mut recorder, trace)?;
+
+        let batch = freq_out.shape[0];
+        let bins = freq_out.shape[2];
+        let frames = freq_out.shape[3];
+        let audio_channels = time_out.shape[1] / sources;
+        {
+            let arena = &mut *self.work.borrow_mut();
+            let scale = arena.upload(gpu, &[batch], std, "ep.std")?;
+            let shift = arena.upload(gpu, &[batch], mean, "ep.mean")?;
+            let scale_t = arena.upload(gpu, &[batch], std_t, "ep.std_t")?;
+            let shift_t = arena.upload(gpu, &[batch], mean_t, "ep.mean_t")?;
+            self.kernels.batch_affine_in_place(
+                gpu, arena, &mut recorder, &freq_out, &scale, &shift, freq_out.len() / batch,
+            )?;
+            self.kernels.batch_affine_in_place(
+                gpu, arena, &mut recorder, &time_out, &scale_t, &shift_t, time_out.len() / batch,
+            )?;
+            let wave_spec = arena.tensor(
+                gpu,
+                &[batch, sources * audio_channels, length],
+                "ep.ispec",
+            )?;
+            self.kernels.ispec_cac_into(
+                gpu,
+                arena,
+                &mut recorder,
+                &freq_out,
+                &self.istft_window,
+                &wave_spec,
+                batch,
+                sources,
+                frames,
+                bins,
+                length,
+            )?;
+            self.kernels
+                .add_in_place(gpu, arena, &mut recorder, &wave_spec, &time_out)?;
+            let (staging, bytes) = stage_readback(gpu, &mut recorder, &wave_spec)?;
+            recorder.submit(gpu)?;
+            let values = array3_from_bytes(&gpu.mapped_bytes(&staging, bytes)?, &wave_spec.shape)?;
+            values
+                .into_shape_with_order((batch, sources, audio_channels, length))
+                .map_err(|e| Error::Shape(format!("stems reshape: {e}")))
+        }
+    }
+
     /// A classic (self-attention) layer: fused QKV projection, flash attention,
     /// out projection, the two feed-forward halves, the three norms and the
     /// residual/LayerScale pairs.
@@ -2029,6 +2096,8 @@ pub struct GpuHtdemucsRunner {
     work: std::cell::RefCell<Arena>,
     /// The transformer's head count and token layout come from the config.
     config: crate::demucs::config::HtdemucsConfig,
+    /// Periodic Hann of `nfft`, uploaded once for the device iSTFT.
+    istft_window: DevTensor,
 }
 
 impl GpuHtdemucsRunner {
@@ -2052,8 +2121,11 @@ impl GpuHtdemucsRunner {
         let kernels = Kernels::new(&gpu)?;
         let mut weight_arena = Arena::new(&gpu, WEIGHT_ARENA_BYTES);
         let weights = GpuWeights::load(host, &gpu, &mut weight_arena)?;
-        let work = std::cell::RefCell::new(Arena::new(&gpu, WORK_ARENA_BYTES));
         let config = host.config.clone();
+        let window = crate::dsp::stft::hann_window(config.nfft);
+        let istft_window =
+            weight_arena.upload(&gpu, &[config.nfft], &window, "istft.window")?;
+        let work = std::cell::RefCell::new(Arena::new(&gpu, WORK_ARENA_BYTES));
         Ok(Self {
             gpu,
             kernels,
@@ -2061,6 +2133,7 @@ impl GpuHtdemucsRunner {
             weights,
             work,
             config,
+            istft_window,
         })
     }
 
@@ -2468,7 +2541,17 @@ pub fn separate_gpu(
     if stage_timing {
         eprintln!("[stg] front end {:?}", front.elapsed());
     }
-    let (freq_out, time_out) = runner.forward_branch_outputs(&mag_norm, &wave_norm, trace)?;
+    let stems = runner.forward_stems(
+        &mag_norm,
+        &wave_norm,
+        &norm.mean,
+        &norm.std,
+        &norm.mean_t,
+        &norm.std_t,
+        sources,
+        training_length,
+        trace,
+    )?;
     if stage_timing {
         eprintln!("[stg] device+readback {:?}", model.elapsed());
         let (labels, ms, ops) = crate::gpu::arena::host_timing_take();
@@ -2480,44 +2563,6 @@ pub fn separate_gpu(
             );
         }
     }
-    let epilogue = std::time::Instant::now();
-
-    // Epilogue.
-    let mut x = freq_out;
-    for bi in 0..batch {
-        // The reference denormalises the mask input with  —
-        // no epsilon, unlike the forward normalisation.
-        let (mean, std) = (norm.mean[bi], norm.std[bi]);
-        x.slice_mut(ndarray::s![bi, .., .., ..])
-            .mapv_inplace(|v| (v + mean / std) * std);
-    }
-    if trace.wants("frequency_branch_out") {
-        trace.record("_mask.in", x.view().into_dyn());
-    }
-    let waveform = {
-        let zout = crate::demucs::spec::unpack_channels_as_complex(&x, sources)?;
-        let zout = crate::demucs::spec::pad_for_ispec(&zout);
-        host.spec.ispec(&zout, training_length, 0)?
-    };
-    if trace.wants("freq_ispec") {
-        trace.record("_ispec.out", waveform.view().into_dyn());
-    }
-
-    let audio_channels = mix.shape()[1];
-    let mut time = time_out
-        .view()
-        .into_shape_with_order((batch, sources, audio_channels, training_length))
-        .expect("contiguous view")
-        .to_owned();
-    for bi in 0..batch {
-        let (mean, std) = (norm.mean_t[bi], norm.std_t[bi]);
-        time.slice_mut(ndarray::s![bi, .., .., ..])
-            .mapv_inplace(|v| (v + mean / std) * std);
-    }
-
-    if stage_timing {
-        eprintln!("[stg] epilogue {:?}", epilogue.elapsed());
-    }
-    Ok(time + waveform)
+    Ok(stems)
 }
 

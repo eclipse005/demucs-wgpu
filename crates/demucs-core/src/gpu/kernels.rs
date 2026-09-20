@@ -399,6 +399,12 @@ pub struct Kernels {
     softmax_warp: Option<wgpu::ComputePipeline>,
     /// Fused attention for `dim_head == 64`, replacing the score-matrix path.
     flash_attention: wgpu::ComputePipeline,
+    /// 4096-point inverse real FFT, one workgroup per spectrogram frame.
+    istft_irfft4096: wgpu::ComputePipeline,
+    /// Overlap-add of those frames onto the waveform, with the Hann envelope.
+    istft_ola: wgpu::ComputePipeline,
+    /// Per-batch scalar affine, the epilogue's denormalise.
+    batch_affine_in_place: wgpu::ComputePipeline,
 }
 
 impl Kernels {
@@ -583,6 +589,17 @@ impl Kernels {
                 "flash_attention",
                 &shaders::flash_attention(),
                 "flash_attention",
+            )?,
+            istft_irfft4096: gpu.pipeline(
+                "istft_irfft4096",
+                &shaders::istft_irfft4096(),
+                "istft_irfft4096",
+            )?,
+            istft_ola: gpu.pipeline("istft_ola", &shaders::istft_ola(), "istft_ola")?,
+            batch_affine_in_place: gpu.pipeline(
+                "batch_affine_in_place",
+                &shaders::batch_affine_in_place(),
+                "batch_affine_in_place",
             )?,
         })
     }
@@ -2575,6 +2592,157 @@ impl Kernels {
         );
         let (gx, gy) = row_grid(count.div_ceil(ROW_THREADS));
         recorder.dispatch("fill_zero", &self.fill_zero, &group, (gx, gy, 1));
+        Ok(())
+    }
+
+    /// `x[i] = x[i] * scale[i / plane] + shift[i / plane]`, in place.
+    ///
+    /// `scale` and `shift` have one value per batch item; `plane` is the number
+    /// of elements that share a batch index (`x.len() / batch`).
+    pub fn batch_affine_in_place(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        x: &DevTensor,
+        scale: &DevTensor,
+        shift: &DevTensor,
+        plane: usize,
+    ) -> Result<()> {
+        let count = x.len();
+        if plane == 0 || count % plane != 0 {
+            return Err(Error::Shape(format!(
+                "batch affine: {count} elements are not a multiple of plane {plane}"
+            )));
+        }
+        let batch = count / plane;
+        if scale.len() < batch || shift.len() < batch {
+            return Err(Error::Shape(format!(
+                "batch affine: scale/shift need {batch} values"
+            )));
+        }
+        let params = self.params(gpu, arena, [count as u32, plane as u32, 0, 0])?;
+        let group = bind_group(
+            gpu,
+            "batch_affine_in_place",
+            &self.batch_affine_in_place.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (count * 4) as u64),
+                (&scale.buffer, scale.offset, (scale.len() * 4) as u64),
+                (&shift.buffer, shift.offset, (shift.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+            ],
+        );
+        let (gx, gy) = row_grid(count.div_ceil(ROW_THREADS));
+        recorder.dispatch(
+            "batch_affine_in_place",
+            &self.batch_affine_in_place,
+            &group,
+            (gx, gy, 1),
+        );
+        Ok(())
+    }
+
+    /// Device `_ispec` for the CaC frequency branch: 4096-point inverse FFT of
+    /// every frame, overlap-add with the Hann envelope, trim to `length`.
+    ///
+    /// `spec` is `(batch, 4*sources, nfft/2, frames)` after denormalise.
+    /// `window` is the periodic Hann of `nfft`. `out` is `(batch, 2*sources, length)`.
+    pub fn ispec_cac_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        spec: &DevTensor,
+        window: &DevTensor,
+        out: &DevTensor,
+        batch: usize,
+        sources: usize,
+        frames: usize,
+        bins: usize,
+        length: usize,
+    ) -> Result<()> {
+        const NFFT: usize = 4096;
+        if window.len() < NFFT {
+            return Err(Error::Shape("istft window is shorter than nfft=4096".into()));
+        }
+        if bins != NFFT / 2 {
+            return Err(Error::Shape(format!(
+                "ispec_cac expected {} bins, got {bins}",
+                NFFT / 2
+            )));
+        }
+        let packed = sources * 4;
+        let packed_out = sources * 2;
+        if spec.shape != [batch, packed, bins, frames] {
+            return Err(Error::Shape(format!(
+                "ispec_cac spec shape {:?} != [{batch}, {packed}, {bins}, {frames}]",
+                spec.shape
+            )));
+        }
+        if out.len() < batch * packed_out * length {
+            return Err(Error::Shape(format!(
+                "ispec_cac out holds {} elements, need {}",
+                out.len(),
+                batch * packed_out * length
+            )));
+        }
+        let hop = NFFT / 4;
+        let pad = hop / 2 * 3;
+        let rows = batch * packed_out;
+        let frame_buf = arena.tensor(
+            gpu,
+            &[rows, frames, NFFT],
+            "istft.frames",
+        )?;
+        let irfft_params = self.params(
+            gpu,
+            arena,
+            [frames as u32, bins as u32, packed as u32, batch as u32],
+        )?;
+        let irfft_group = bind_group(
+            gpu,
+            "istft_irfft4096",
+            &self.istft_irfft4096.get_bind_group_layout(0),
+            &[
+                (&spec.buffer, spec.offset, (spec.len() * 4) as u64),
+                (&window.buffer, window.offset, (NFFT * 4) as u64),
+                (&frame_buf.buffer, frame_buf.offset, (frame_buf.len() * 4) as u64),
+                (&irfft_params.buffer, irfft_params.offset, 16),
+            ],
+        );
+        recorder.dispatch(
+            "istft_irfft4096",
+            &self.istft_irfft4096,
+            &irfft_group,
+            (frames.max(1) as u32, rows.max(1) as u32, 1),
+        );
+
+        let ola_gd = self.params(
+            gpu,
+            arena,
+            [frames as u32, hop as u32, NFFT as u32, pad as u32],
+        )?;
+        let ola_ge = self.params(
+            gpu,
+            arena,
+            [length as u32, packed_out as u32, batch as u32, 0],
+        )?;
+        let ola_group = bind_group(
+            gpu,
+            "istft_ola",
+            &self.istft_ola.get_bind_group_layout(0),
+            &[
+                (&frame_buf.buffer, frame_buf.offset, (frame_buf.len() * 4) as u64),
+                (&window.buffer, window.offset, (NFFT * 4) as u64),
+                (&out.buffer, out.offset, (out.len() * 4) as u64),
+                (&ola_gd.buffer, ola_gd.offset, 16),
+                (&ola_ge.buffer, ola_ge.offset, 16),
+            ],
+        );
+        let samples = batch * packed_out * length;
+        let (gx, gy) = row_grid(samples.div_ceil(ROW_THREADS));
+        recorder.dispatch("istft_ola", &self.istft_ola, &ola_group, (gx, gy, 1));
         Ok(())
     }
 
