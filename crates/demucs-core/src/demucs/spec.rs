@@ -52,6 +52,12 @@ impl DemucsSpec {
         length.div_ceil(self.hop)
     }
 
+    /// The reflect pad `_spec` applies before `torch.stft`, so the device STFT
+    /// can consume the same samples.
+    pub fn pad_mix(&self, mix: &Array3<f32>) -> Result<Array3<f32>> {
+        pad_mix_for_spec(mix, self.hop)
+    }
+
     /// `HTDemucs._spec`: `(b, c, length)` samples to `(b, c, nfft/2, le)` complex.
     pub fn spec(&self, mix: &Array3<f32>) -> Result<Array4<Complex32>> {
         let (b, c, length) = mix.dim();
@@ -167,6 +173,29 @@ impl DemucsSpec {
         }
         Ok(out)
     }
+}
+
+/// Reflect-pad a mix the way `_spec` does before `torch.stft`.
+pub fn pad_mix_for_spec(mix: &Array3<f32>, hop: usize) -> Result<Array3<f32>> {
+    let (b, c, length) = mix.dim();
+    let le = length.div_ceil(hop);
+    let pad = hop / 2 * 3;
+    let right = pad + le * hop - length;
+    let padded_length = length + pad + right;
+    let mut padded = Array3::<f32>::zeros((b, c, padded_length));
+    let source = mix
+        .as_slice()
+        .ok_or_else(|| Error::Shape("_spec needs a standard-layout input".into()))?;
+    for bi in 0..b {
+        for ci in 0..c {
+            let row = &source[(bi * c + ci) * length..(bi * c + ci + 1) * length];
+            let values = pad1d_reflect(row, pad, right)?;
+            padded
+                .slice_mut(s![bi, ci, ..])
+                .assign(&ndarray::ArrayView1::from(&values));
+        }
+    }
+    Ok(padded)
 }
 
 /// `pad1d(x, (left, right), mode='reflect')` from `hdemucs.py`, including its

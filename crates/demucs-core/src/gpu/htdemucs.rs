@@ -7,8 +7,8 @@
 //! every traced stage by name — so each further stage can be moved over and
 //! checked independently of everything after it.
 //!
-//! Split of work: `torch.stft` stays on the host; the inverse STFT, CaC unpack
-//! and branch sum run on the device so a chunk only reads back the waveforms.
+//! Split of work: the host reflect-pads the mix; STFT, both stacks, iSTFT and
+//! the branch sum run on the device so a chunk only reads back the waveforms.
 //! One `Recorder` builds the whole device graph and submits it once.
 //!
 //! **Weights come from the host model**, which is the architecture description
@@ -1564,6 +1564,15 @@ impl GpuHtdemucsRunner {
         trace: &mut dyn TraceSink,
     ) -> Result<(DevTensor, DevTensor, EncoderStack)> {
         let stack = self.run_encoder_stack(freq_mag, wave, recorder, trace)?;
+        self.after_encoders(stack, recorder, trace)
+    }
+
+    fn after_encoders(
+        &self,
+        stack: EncoderStack,
+        recorder: &mut Recorder,
+        trace: &mut dyn TraceSink,
+    ) -> Result<(DevTensor, DevTensor, EncoderStack)> {
         let batch = stack.freq_enc.shape[0];
         let freq_dims = stack.freq_enc.shape.clone();
         let time_samples = stack.time_enc.shape[2];
@@ -1827,43 +1836,89 @@ impl GpuHtdemucsRunner {
         Ok((freq_read, time_read))
     }
 
-    /// Encoder through decoder plus the CaC iSTFT epilogue, still one submit.
-    ///
-    /// Only the summed waveforms come back: `(batch, sources, channels, length)`.
+    /// Mix in, stems out, one submit: STFT, both stacks, iSTFT.
     fn forward_stems(
         &self,
-        freq_mag: &Array4<f32>,
-        wave: &Array3<f32>,
-        mean: &[f32],
-        std: &[f32],
-        mean_t: &[f32],
-        std_t: &[f32],
+        mix: &Array3<f32>,
         sources: usize,
         length: usize,
         trace: &mut dyn TraceSink,
     ) -> Result<Array4<f32>> {
         let gpu = &self.gpu;
+        let hop = self.config.hop_length();
+        let nfft = self.config.nfft;
+        let bins = nfft / 2;
+        let le = length.div_ceil(hop);
+        let batch = mix.shape()[0];
+        let channels = mix.shape()[1];
+        let padded = crate::demucs::spec::pad_mix_for_spec(mix, hop)?;
         let mut recorder = Recorder::new(gpu);
-        let (freq_dev, time_dev, stack) =
-            self.run_to_decoder_inputs(freq_mag, wave, &mut recorder, trace)?;
+
+        let (stack, mean, std, mean_t, std_t) = {
+            let arena = &mut *self.work.borrow_mut();
+            arena.reset();
+            let padded_dev = arena.upload(
+                gpu,
+                padded.shape(),
+                padded.as_slice().expect("standard layout"),
+                "mix.pad",
+            )?;
+            let mix_dev = arena.upload(
+                gpu,
+                mix.shape(),
+                mix.as_slice().expect("standard layout"),
+                "mix.in",
+            )?;
+            let mag = arena.tensor(gpu, &[batch, channels * 2, bins, le], "freq.in")?;
+            self.kernels.stft_cac_into(
+                gpu,
+                arena,
+                &mut recorder,
+                &padded_dev,
+                &self.istft_window,
+                &mag,
+                batch,
+                channels,
+                padded.shape()[2],
+                le,
+                bins,
+                hop,
+                nfft,
+            )?;
+            let mean = arena.tensor(gpu, &[batch], "mag.mean")?;
+            let std = arena.tensor(gpu, &[batch], "mag.std")?;
+            let mean_t = arena.tensor(gpu, &[batch], "wav.mean")?;
+            let std_t = arena.tensor(gpu, &[batch], "wav.std")?;
+            self.kernels.batch_moments_into(
+                gpu, arena, &mut recorder, &mag, &mean, &std, mag.len() / batch,
+            )?;
+            self.kernels.batch_moments_into(
+                gpu, arena, &mut recorder, &mix_dev, &mean_t, &std_t, mix_dev.len() / batch,
+            )?;
+            self.kernels.batch_normalize_in_place(
+                gpu, arena, &mut recorder, &mag, &mean, &std, mag.len() / batch,
+            )?;
+            self.kernels.batch_normalize_in_place(
+                gpu, arena, &mut recorder, &mix_dev, &mean_t, &std_t, mix_dev.len() / batch,
+            )?;
+            let stack = self.encoder_layers(arena, mag, mix_dev, &mut recorder, trace)?;
+            (stack, mean, std, mean_t, std_t)
+        };
+
+        let (freq_dev, time_dev, stack) = self.after_encoders(stack, &mut recorder, trace)?;
         let (freq_out, time_out) =
             self.run_decoders(freq_dev, time_dev, stack, &mut recorder, trace)?;
 
-        let batch = freq_out.shape[0];
         let bins = freq_out.shape[2];
         let frames = freq_out.shape[3];
         let audio_channels = time_out.shape[1] / sources;
         {
             let arena = &mut *self.work.borrow_mut();
-            let scale = arena.upload(gpu, &[batch], std, "ep.std")?;
-            let shift = arena.upload(gpu, &[batch], mean, "ep.mean")?;
-            let scale_t = arena.upload(gpu, &[batch], std_t, "ep.std_t")?;
-            let shift_t = arena.upload(gpu, &[batch], mean_t, "ep.mean_t")?;
             self.kernels.batch_affine_in_place(
-                gpu, arena, &mut recorder, &freq_out, &scale, &shift, freq_out.len() / batch,
+                gpu, arena, &mut recorder, &freq_out, &std, &mean, freq_out.len() / batch,
             )?;
             self.kernels.batch_affine_in_place(
-                gpu, arena, &mut recorder, &time_out, &scale_t, &shift_t, time_out.len() / batch,
+                gpu, arena, &mut recorder, &time_out, &std_t, &mean_t, time_out.len() / batch,
             )?;
             let wave_spec = arena.tensor(
                 gpu,
@@ -2188,22 +2243,32 @@ impl GpuHtdemucsRunner {
         recorder: &mut Recorder,
         trace: &mut dyn TraceSink,
     ) -> Result<EncoderStack> {
-        let mut recorder = recorder;
         let arena = &mut *self.work.borrow_mut();
         arena.reset();
-
         let gpu = &self.gpu;
-        let kernels = &self.kernels;
-        let dims = freq_mag.shape();
-        let (batch, _channels, bins, frames) = (dims[0], dims[1], dims[2], dims[3]);
-
-        let mut freq = arena.upload(gpu, freq_mag.shape(), freq_mag.as_slice().expect("standard layout"), "freq.in")?;
-        let mut time = arena.upload(
+        let freq = arena.upload(gpu, freq_mag.shape(), freq_mag.as_slice().expect("standard layout"), "freq.in")?;
+        let time = arena.upload(
             gpu,
             wave.shape(),
             wave.as_slice().expect("standard layout"),
             "time.in",
         )?;
+        self.encoder_layers(arena, freq, time, recorder, trace)
+    }
+
+    fn encoder_layers(
+        &self,
+        arena: &mut Arena,
+        mut freq: DevTensor,
+        mut time: DevTensor,
+        recorder: &mut Recorder,
+        trace: &mut dyn TraceSink,
+    ) -> Result<EncoderStack> {
+        let mut recorder = recorder;
+        let gpu = &self.gpu;
+        let kernels = &self.kernels;
+        let dims = &freq.shape;
+        let (batch, _channels, bins, frames) = (dims[0], dims[1], dims[2], dims[3]);
 
         // One scratch sized to the larger of the encoder and decoder planes
         // (decoder.3's 3×3 rewrite is the global max, ~283 MiB at 7.8 s).
@@ -2497,9 +2562,8 @@ fn array3_from_bytes(data: &[u8], shape: &[usize]) -> Result<Array3<f32>> {
         .map_err(|e| Error::Shape(format!("readback: {e}")))
 }
 
-/// The full separation path on device: the host front end (STFT, packing,
-/// per-branch normalisation), the device encoder/transformer/decoder stacks,
-/// and the host epilogue (denormalise, CaC masking, inverse STFT, branch sum).
+/// The full separation path on device: STFT, both stacks, iSTFT, one submit.
+/// The host only reflect-pads the mix and maps the waveform readback.
 ///
 /// `mix` may stack several same-shaped chunks on its batch axis — the split
 /// path pads every chunk to the segment length, so that is the natural shape
@@ -2510,7 +2574,6 @@ pub fn separate_gpu(
     mix: &Array3<f32>,
     trace: &mut dyn TraceSink,
 ) -> Result<Array4<f32>> {
-    let batch = mix.shape()[0];
     let sources = host.config.sources.len();
     let training_length = host.training_length();
 
@@ -2518,40 +2581,11 @@ pub fn separate_gpu(
     // stats are per batch element, so the loops run over all of them.
     let stage_timing = std::env::var("DEMUCS_STAGE_TIMING").is_ok();
     let front = std::time::Instant::now();
-    let z = host.spec.spec(mix)?;
-    let mag = crate::demucs::spec::pack_complex_as_channels(&z);
-    let norm = host.normalise(&mag, mix);
-    let mut mag_norm = mag.clone();
-    for bi in 0..batch {
-        let (offset, scale) = (norm.mean[bi], norm.std[bi]);
-        mag_norm
-            .slice_mut(ndarray::s![bi, .., .., ..])
-            .mapv_inplace(|v| (v - offset) / (1e-5 + scale));
-    }
-    let mut wave_norm = mix.clone();
-    for bi in 0..batch {
-        let (offset, scale) = (norm.mean_t[bi], norm.std_t[bi]);
-        wave_norm
-            .slice_mut(ndarray::s![bi, .., ..])
-            .mapv_inplace(|v| (v - offset) / (1e-5 + scale));
-    }
-
-    // Device stacks.
     let model = std::time::Instant::now();
     if stage_timing {
         eprintln!("[stg] front end {:?}", front.elapsed());
     }
-    let stems = runner.forward_stems(
-        &mag_norm,
-        &wave_norm,
-        &norm.mean,
-        &norm.std,
-        &norm.mean_t,
-        &norm.std_t,
-        sources,
-        training_length,
-        trace,
-    )?;
+    let stems = runner.forward_stems(mix, sources, training_length, trace)?;
     if stage_timing {
         eprintln!("[stg] device+readback {:?}", model.elapsed());
         let (labels, ms, ops) = crate::gpu::arena::host_timing_take();

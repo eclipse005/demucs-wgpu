@@ -3173,6 +3173,184 @@ fn istft_irfft4096(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocat
     .to_string()
 }
 
+/// 4096-point real forward FFT of one STFT frame, written as CaC `(re, im)`
+/// channels. Twiddles are `exp(-2πi…)`, matching rustfft; the store applies
+/// `1/sqrt(nfft)` (`normalized=True`) and drops the Nyquist bin.
+///
+/// `Mix` is `_spec`'s reflect-padded waveform `(batch, channels, padded_len)`.
+/// Output frame `f` is STFT frame `f+2` (the two padding frames `_spec` drops).
+/// Center pad `nfft/2` is applied in-index, not by writing a second buffer.
+pub fn stft_rfft4096() -> String {
+    r#"
+@group(0) @binding(0) var<storage, read> Mix: array<f32>;
+@group(0) @binding(1) var<storage, read> Win: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // le, bins, channels, hop
+@group(0) @binding(4) var<uniform> ge: vec4<u32>;  // padded_len, center, batch, _
+
+const N: u32 = 4096u;
+const BITS: u32 = 12u;
+const THREADS: u32 = 256u;
+const PER: u32 = 16u;
+const PI2: f32 = 6.283185307179586;
+
+var<workgroup> sm: array<vec2<f32>, 4096>;
+
+fn bitrev12(x: u32) -> u32 {
+    return reverseBits(x) >> (32u - BITS);
+}
+
+fn reflect_at(idx: i32, len: i32) -> u32 {
+    if (idx < 0) {
+        return u32(-idx);
+    }
+    if (idx >= len) {
+        return u32(2 * len - 2 - idx);
+    }
+    return u32(idx);
+}
+
+@compute @workgroup_size(256)
+fn stft_rfft4096(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let le = gd.x;
+    let bins = gd.y;
+    let channels = gd.z;
+    let hop = gd.w;
+    let padded_len = ge.x;
+    let center = ge.y;
+    let frame = wid.x;
+    let row = wid.y;
+    if (frame >= le) { return; }
+
+    let b = row / channels;
+    let ch = row % channels;
+    let mix_base = (b * channels + ch) * padded_len;
+    let start = (frame + 2u) * hop;
+    let plen = i32(padded_len);
+    let cpad = i32(center);
+
+    for (var p = 0u; p < PER; p++) {
+        let k = lid.x + p * THREADS;
+        let src = reflect_at(i32(start + k) - cpad, plen);
+        let v = Mix[mix_base + src] * Win[k];
+        sm[bitrev12(k)] = vec2(v, 0.0);
+    }
+    workgroupBarrier();
+
+    for (var stage = 0u; stage < BITS; stage++) {
+        let m = 1u << (stage + 1u);
+        let mh = m >> 1u;
+        workgroupBarrier();
+        for (var p = 0u; p < 8u; p++) {
+            let bfly = lid.x + p * THREADS;
+            let j = bfly % mh;
+            let grp = bfly / mh;
+            let idx = grp * m + j;
+            let pair = idx + mh;
+            let a = sm[idx];
+            let bval = sm[pair];
+            let angle = PI2 * f32(j) / f32(m);
+            let wr = cos(angle);
+            let wi = -sin(angle);
+            let t = vec2(bval.x * wr - bval.y * wi, bval.x * wi + bval.y * wr);
+            sm[idx] = a + t;
+            sm[pair] = a - t;
+        }
+    }
+    workgroupBarrier();
+
+    let inv = 0.015625;
+    let packed = channels * 2u;
+    let re_ch = ch * 2u;
+    let im_ch = re_ch + 1u;
+    let re_base = ((b * packed + re_ch) * bins) * le + frame;
+    let im_base = ((b * packed + im_ch) * bins) * le + frame;
+    for (var p = 0u; p < PER; p++) {
+        let k = lid.x + p * THREADS;
+        if (k < bins) {
+            Out[re_base + k * le] = sm[k].x * inv;
+            Out[im_base + k * le] = sm[k].y * inv;
+        }
+    }
+}
+"#
+    .to_string()
+}
+
+/// Per-batch mean and unbiased std of a contiguous plane.
+pub fn batch_moments() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Mean: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Std: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // plane, batch, _, _
+
+const THREADS: u32 = {threads}u;
+var<workgroup> sum_s: array<f32, {threads}>;
+var<workgroup> sum_q: array<f32, {threads}>;
+
+@compute @workgroup_size({threads})
+fn batch_moments(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let plane = gd.x;
+    let b = wid.x;
+    if (b >= gd.y) {{ return; }}
+    let base = b * plane;
+    var s = 0.0;
+    var q = 0.0;
+    for (var i = lid.x; i < plane; i = i + THREADS) {{
+        let v = X[base + i];
+        s = s + v;
+        q = q + v * v;
+    }}
+    sum_s[lid.x] = s;
+    sum_q[lid.x] = q;
+    workgroupBarrier();
+    for (var step = THREADS / 2u; step > 0u; step = step / 2u) {{
+        if (lid.x < step) {{
+            sum_s[lid.x] = sum_s[lid.x] + sum_s[lid.x + step];
+            sum_q[lid.x] = sum_q[lid.x] + sum_q[lid.x + step];
+        }}
+        workgroupBarrier();
+    }}
+    if (lid.x == 0u) {{
+        let n = f32(plane);
+        let mean = sum_s[0] / n;
+        let variance = (sum_q[0] - mean * mean * n) / (n - 1.0);
+        Mean[b] = mean;
+        Std[b] = sqrt(max(variance, 0.0));
+    }}
+}}
+"#,
+        threads = ROW_THREADS,
+    )
+}
+
+/// `x = (x - mean) / (1e-5 + std)` per batch item, in place.
+pub fn batch_normalize_in_place() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(1) var<storage, read> Mean: array<f32>;
+@group(0) @binding(2) var<storage, read> Std: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // count, plane, _, _
+
+const THREADS: u32 = {threads}u;
+const GRID_X: u32 = {grid_x}u;
+
+@compute @workgroup_size({threads})
+fn batch_normalize_in_place(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let i = (wid.y * GRID_X + wid.x) * THREADS + lid.x;
+    if (i >= gd.x) {{ return; }}
+    let b = i / gd.y;
+    Out[i] = (Out[i] - Mean[b]) / (1e-5 + Std[b]);
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X,
+    )
+}
+
 /// Overlap-add of windowed iFFT frames onto `length` samples, then divide by
 /// the Hann envelope. Frame `f` lands at offset `(f+2)*hop` because `_ispec`
 /// pads two zero frames on the left; those frames are skipped (they are zero).

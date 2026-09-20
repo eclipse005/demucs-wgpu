@@ -1,7 +1,10 @@
 //! Device `_ispec` vs the host STFT inverse on HTDemucs shapes.
 
 use demucs_core::demucs::config::HtdemucsConfig;
-use demucs_core::demucs::spec::{pad_for_ispec, unpack_channels_as_complex, DemucsSpec};
+use demucs_core::demucs::spec::{
+    pack_complex_as_channels, pad_for_ispec, pad_mix_for_spec, unpack_channels_as_complex,
+    DemucsSpec,
+};
 use demucs_core::dsp::stft::hann_window;
 use demucs_core::fixtures::compare;
 use demucs_core::gpu::arena::{Arena, Recorder};
@@ -97,5 +100,76 @@ fn device_ispec_matches_the_host_on_a_short_segment() {
     assert!(
         snr > 100.0,
         "device ispec {snr:.2} dB, want > 100 against the host inverse"
+    );
+}
+
+#[test]
+fn device_stft_matches_the_host_on_a_short_segment() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let config = HtdemucsConfig::default();
+    let spec = DemucsSpec::new(&config).unwrap();
+    let nfft = config.nfft;
+    let bins = nfft / 2;
+    let hop = config.hop_length();
+    let length = hop * 8;
+    let le = spec.frames_for(length);
+    let batch = 1usize;
+    let channels = 2usize;
+
+    let mix_data = fill(batch * channels * length, 11);
+    let mix = ndarray::Array3::from_shape_vec((batch, channels, length), mix_data).unwrap();
+    let host = pack_complex_as_channels(&spec.spec(&mix).unwrap());
+    let padded = pad_mix_for_spec(&mix, hop).unwrap();
+
+    let kernels = Kernels::new(&gpu).unwrap();
+    let mut arena = Arena::new(&gpu, 256 << 20);
+    let mut recorder = Recorder::new(&gpu);
+    let window = hann_window(nfft);
+    let win = arena.upload(&gpu, &[nfft], &window, "win").unwrap();
+    let padded_dev = arena
+        .upload(
+            &gpu,
+            padded.shape(),
+            padded.as_slice().unwrap(),
+            "pad",
+        )
+        .unwrap();
+    let out = arena
+        .tensor(&gpu, &[batch, channels * 2, bins, le], "mag")
+        .unwrap();
+    kernels
+        .stft_cac_into(
+            &gpu,
+            &mut arena,
+            &mut recorder,
+            &padded_dev,
+            &win,
+            &out,
+            batch,
+            channels,
+            padded.shape()[2],
+            le,
+            bins,
+            hop,
+            nfft,
+        )
+        .unwrap();
+    recorder.submit(&gpu).unwrap();
+    let bytes = gpu
+        .readback(&out.buffer, (out.len() * 4) as u64)
+        .unwrap();
+    let values: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+    let device =
+        Array4::from_shape_vec((batch, channels * 2, bins, le), values).unwrap();
+
+    let snr = compare(host.as_slice().unwrap(), device.as_slice().unwrap())
+        .unwrap()
+        .snr_db();
+    println!("device stft vs host: {snr:.2} dB");
+    assert!(
+        snr > 100.0,
+        "device stft {snr:.2} dB, want > 100 against the host spectrogram"
     );
 }

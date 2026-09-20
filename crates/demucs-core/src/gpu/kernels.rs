@@ -407,6 +407,12 @@ pub struct Kernels {
     istft_ola: wgpu::ComputePipeline,
     /// Per-batch scalar affine, the epilogue's denormalise.
     batch_affine_in_place: wgpu::ComputePipeline,
+    /// 4096-point real forward FFT of one STFT frame.
+    stft_rfft4096: wgpu::ComputePipeline,
+    /// Per-batch mean and unbiased std.
+    batch_moments: wgpu::ComputePipeline,
+    /// `(x - mean) / (1e-5 + std)` per batch item.
+    batch_normalize_in_place: wgpu::ComputePipeline,
 }
 
 impl Kernels {
@@ -611,6 +617,21 @@ impl Kernels {
                 "batch_affine_in_place",
                 &shaders::batch_affine_in_place(),
                 "batch_affine_in_place",
+            )?,
+            stft_rfft4096: gpu.pipeline(
+                "stft_rfft4096",
+                &shaders::stft_rfft4096(),
+                "stft_rfft4096",
+            )?,
+            batch_moments: gpu.pipeline(
+                "batch_moments",
+                &shaders::batch_moments(),
+                "batch_moments",
+            )?,
+            batch_normalize_in_place: gpu.pipeline(
+                "batch_normalize_in_place",
+                &shaders::batch_normalize_in_place(),
+                "batch_normalize_in_place",
             )?,
         })
     }
@@ -2639,6 +2660,149 @@ impl Kernels {
         recorder.dispatch(
             "batch_affine_in_place",
             &self.batch_affine_in_place,
+            &group,
+            (gx, gy, 1),
+        );
+        Ok(())
+    }
+
+    /// Device `_spec` + CaC pack: `padded` is `_spec`'s reflect-padded mix
+    /// `(batch, channels, padded_len)`. `out` is `(batch, 2*channels, nfft/2, le)`.
+    pub fn stft_cac_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        padded: &DevTensor,
+        window: &DevTensor,
+        out: &DevTensor,
+        batch: usize,
+        channels: usize,
+        padded_len: usize,
+        le: usize,
+        bins: usize,
+        hop: usize,
+        nfft: usize,
+    ) -> Result<()> {
+        if nfft != 4096 {
+            return Err(Error::Shape(format!("stft_cac needs nfft=4096, got {nfft}")));
+        }
+        if padded.shape != [batch, channels, padded_len] {
+            return Err(Error::Shape(format!(
+                "stft padded shape {:?} != [{batch}, {channels}, {padded_len}]",
+                padded.shape
+            )));
+        }
+        if out.shape != [batch, channels * 2, bins, le] {
+            return Err(Error::Shape(format!(
+                "stft out shape {:?} != [{batch}, {}, {bins}, {le}]",
+                out.shape,
+                channels * 2
+            )));
+        }
+        let gd = self.params(
+            gpu,
+            arena,
+            [le as u32, bins as u32, channels as u32, hop as u32],
+        )?;
+        let ge = self.params(
+            gpu,
+            arena,
+            [padded_len as u32, (nfft / 2) as u32, batch as u32, 0],
+        )?;
+        let group = bind_group(
+            gpu,
+            "stft_rfft4096",
+            &self.stft_rfft4096.get_bind_group_layout(0),
+            &[
+                (&padded.buffer, padded.offset, (padded.len() * 4) as u64),
+                (&window.buffer, window.offset, (nfft * 4) as u64),
+                (&out.buffer, out.offset, (out.len() * 4) as u64),
+                (&gd.buffer, gd.offset, 16),
+                (&ge.buffer, ge.offset, 16),
+            ],
+        );
+        recorder.dispatch(
+            "stft_rfft4096",
+            &self.stft_rfft4096,
+            &group,
+            (le.max(1) as u32, (batch * channels).max(1) as u32, 1),
+        );
+        Ok(())
+    }
+
+    /// Mean and unbiased std of each batch item's plane, written to `mean`/`std`.
+    pub fn batch_moments_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        x: &DevTensor,
+        mean: &DevTensor,
+        std: &DevTensor,
+        plane: usize,
+    ) -> Result<()> {
+        let count = x.len();
+        if plane == 0 || count % plane != 0 {
+            return Err(Error::Shape(format!(
+                "batch moments: {count} is not a multiple of plane {plane}"
+            )));
+        }
+        let batch = count / plane;
+        let params = self.params(gpu, arena, [plane as u32, batch as u32, 0, 0])?;
+        let group = bind_group(
+            gpu,
+            "batch_moments",
+            &self.batch_moments.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (count * 4) as u64),
+                (&mean.buffer, mean.offset, (mean.len() * 4) as u64),
+                (&std.buffer, std.offset, (std.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+            ],
+        );
+        recorder.dispatch(
+            "batch_moments",
+            &self.batch_moments,
+            &group,
+            (batch.max(1) as u32, 1, 1),
+        );
+        Ok(())
+    }
+
+    /// `x = (x - mean) / (1e-5 + std)` per batch item.
+    pub fn batch_normalize_in_place(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        x: &DevTensor,
+        mean: &DevTensor,
+        std: &DevTensor,
+        plane: usize,
+    ) -> Result<()> {
+        let count = x.len();
+        if plane == 0 || count % plane != 0 {
+            return Err(Error::Shape(format!(
+                "batch normalize: {count} is not a multiple of plane {plane}"
+            )));
+        }
+        let params = self.params(gpu, arena, [count as u32, plane as u32, 0, 0])?;
+        let group = bind_group(
+            gpu,
+            "batch_normalize_in_place",
+            &self.batch_normalize_in_place.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (count * 4) as u64),
+                (&mean.buffer, mean.offset, (mean.len() * 4) as u64),
+                (&std.buffer, std.offset, (std.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+            ],
+        );
+        let (gx, gy) = row_grid(count.div_ceil(ROW_THREADS));
+        recorder.dispatch(
+            "batch_normalize_in_place",
+            &self.batch_normalize_in_place,
             &group,
             (gx, gy, 1),
         );
