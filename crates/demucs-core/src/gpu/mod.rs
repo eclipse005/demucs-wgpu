@@ -13,6 +13,9 @@ pub mod kernels;
 pub mod shaders;
 
 use crate::error::{Error, Result};
+use crate::gpu::arena::{host_timing_add, DevTensor, Slot};
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 /// True when a 32-lane xor butterfly reduces correctly on this adapter.
 ///
@@ -141,6 +144,13 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: DeviceInfo,
+    /// One uniform buffer for a whole forward. Per-dispatch 16-byte writes
+    /// were ~21 ms/chunk; packing them and flushing once at submit is the same
+    /// bytes at one `write_buffer`.
+    uniform_slot: Arc<Slot>,
+    uniform_align: usize,
+    uniform_host: RefCell<Vec<u8>>,
+    uniform_used: Cell<usize>,
 }
 
 /// One adapter as `demucs adapters` shows it. `index` is the one a
@@ -272,11 +282,66 @@ impl Gpu {
             adapter: adapter_info,
         };
 
+        let uniform_align = (limits.min_uniform_buffer_offset_alignment as usize).max(16);
+        // ~1300 uniforms/chunk × 256 B align; 2 MiB is several forwards of slack.
+        let uniform_cap = 2 << 20;
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms"),
+            size: uniform_cap,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             device,
             queue,
             info,
+            uniform_slot: Slot::detached(uniform_buf, uniform_cap),
+            uniform_align,
+            uniform_host: RefCell::new(vec![0u8; uniform_cap as usize]),
+            uniform_used: Cell::new(0),
         })
+    }
+
+    /// Appends a uniform block for the current forward. The bytes land on the
+    /// device in [`flush_uniforms`], which `Recorder::submit` calls once.
+    pub fn push_uniform(&self, data: &[u8]) -> Result<DevTensor> {
+        let align = self.uniform_align;
+        let used = self.uniform_used.get();
+        let start = used.div_ceil(align) * align;
+        let cap = self.uniform_host.borrow().len();
+        if start + data.len().max(16) > cap {
+            return Err(Error::Gpu(format!(
+                "uniform pack overflow: {} uniforms need more than {cap} bytes",
+                start / align + 1
+            )));
+        }
+        self.uniform_host.borrow_mut()[start..start + data.len()].copy_from_slice(data);
+        self.uniform_used.set(start + data.len().max(16).next_multiple_of(align));
+        Ok(DevTensor {
+            buffer: Arc::clone(&self.uniform_slot),
+            offset: start as u64,
+            shape: vec![data.len().div_ceil(4)],
+        })
+    }
+
+    /// One `write_buffer` of every uniform recorded since the last reset.
+    pub fn flush_uniforms(&self) {
+        let used = self.uniform_used.get();
+        if used == 0 {
+            return;
+        }
+        let started = std::time::Instant::now();
+        self.queue
+            .write_buffer(&**self.uniform_slot, 0, &self.uniform_host.borrow()[..used]);
+        host_timing_add("stage_write", started.elapsed());
+    }
+
+    /// Clears the pack so the next forward reuses the buffer from offset 0.
+    /// Only after the previous submission has been queued (and, for this
+    /// runner, waited on).
+    pub fn reset_uniforms(&self) {
+        self.uniform_used.set(0);
     }
 
     /// Storage buffer, 16-byte aligned and padded, with the copy usages a

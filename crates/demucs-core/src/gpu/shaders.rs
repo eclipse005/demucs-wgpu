@@ -2051,6 +2051,62 @@ fn softmax_in_place(
     )
 }
 
+/// Out-of-place scaled softmax, one warp per row, any column count.
+///
+/// The in-place warp kernel only covers 64 columns (two loads per lane).
+/// Attention's scores are thousands wide, so this walks the row in `LANES`
+/// steps and uses the same shuffle reductions. No workgroup barrier: each
+/// warp is an independent row.
+pub fn softmax_scaled_warp() -> String {
+    const LANES: u32 = 32;
+    const WARPS: u32 = 8;
+    const THREADS: u32 = LANES * WARPS;
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(2) var<uniform> gd: vec4<u32>;  // rows, cols, scale_bits, _
+
+const LANES: u32 = {lanes}u;
+const WARPS: u32 = {warps}u;
+const ROW_GRID_X: u32 = {grid_x}u;
+
+@compute @workgroup_size({threads})
+fn softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let cols = gd.y;
+    let scale = bitcast<f32>(gd.z);
+    let warp = lid.x / LANES;
+    let lane = lid.x % LANES;
+    let row = (wid.x + wid.y * ROW_GRID_X) * WARPS + warp;
+    let safe_row = min(row, gd.x - 1u);
+    let base = safe_row * cols;
+
+    var local_max = -3.402823e38;
+    for (var i = lane; i < cols; i = i + LANES) {{
+        local_max = max(local_max, X[base + i] * scale);
+    }}
+    let row_max = subgroupMax(local_max);
+
+    var local_sum = 0.0;
+    for (var i = lane; i < cols; i = i + LANES) {{
+        local_sum = local_sum + exp(X[base + i] * scale - row_max);
+    }}
+    let total = subgroupAdd(local_sum);
+    let inv = select(0.0, 1.0 / total, total > 0.0);
+    if (row < gd.x) {{
+        for (var i = lane; i < cols; i = i + LANES) {{
+            Out[base + i] = exp(X[base + i] * scale - row_max) * inv;
+        }}
+    }}
+}}
+"#,
+        lanes = LANES,
+        warps = WARPS,
+        threads = THREADS,
+        grid_x = ROW_GRID_X,
+    )
+}
+
 /// Rows one warp-per-row softmax workgroup covers.
 pub const SOFTMAX_WARP_ROWS_PER_WG: usize = 8;
 /// Columns one lane of the warp softmax covers, i.e. the widest row it takes.

@@ -397,6 +397,8 @@ pub struct Kernels {
     /// 64 columns, where the tree's six barriers cost more than the arithmetic.
     /// Only built when the adapter can reduce across a 32-lane subgroup.
     softmax_warp: Option<wgpu::ComputePipeline>,
+    /// Out-of-place scaled softmax, one warp per row, any width.
+    softmax_scaled_warp: Option<wgpu::ComputePipeline>,
     /// Fused attention for `dim_head == 64`, replacing the score-matrix path.
     flash_attention: wgpu::ComputePipeline,
     /// 4096-point inverse real FFT, one workgroup per spectrogram frame.
@@ -585,6 +587,15 @@ impl Kernels {
             } else {
                 None
             },
+            softmax_scaled_warp: if gpu.info.shuffle_reduction {
+                Some(gpu.pipeline(
+                    "softmax_scaled_warp",
+                    &shaders::softmax_scaled_warp(),
+                    "softmax",
+                )?)
+            } else {
+                None
+            },
             flash_attention: gpu.pipeline(
                 "flash_attention",
                 &shaders::flash_attention(),
@@ -604,15 +615,11 @@ impl Kernels {
         })
     }
 
-    /// Allocates a 16-byte uniform from the arena and fills it.
-    ///
-    /// Deliberately a fresh allocation per dispatch: reusing one would make every
-    /// dispatch in the graph read the *last* value written, because
-    /// `Queue::write_buffer` is ordered against submission rather than against
-    /// individual dispatches.
-    fn params(&self, gpu: &Gpu, arena: &mut Arena, values: [u32; 4]) -> Result<DevTensor> {
-        let bytes: &[u8] = bytemuck::cast_slice(&values);
-        arena.upload_bytes(gpu, &[4], bytes, "params")
+    /// A 16-byte uniform slot in the per-forward pack. Offsets are unique, so
+    /// every dispatch sees its own value; the bytes go out in one `write_buffer`
+    /// at submit.
+    fn params(&self, gpu: &Gpu, _arena: &mut Arena, values: [u32; 4]) -> Result<DevTensor> {
+        gpu.push_uniform(bytemuck::cast_slice(&values))
     }
 
     /// `out[m, n] = x[m, k] @ w[k, n]`.
@@ -694,7 +701,7 @@ impl Kernels {
             csc_inner: job.c_inner as u32,
             _pad: 0,
         };
-        let params = arena.upload_bytes(gpu, &[64], bytemuck::bytes_of(&dims), "gemm.dims")?;
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
         let grid = job.grid_with(tile.0, tile.1);
         let group = bind_group(
             gpu,
@@ -794,7 +801,7 @@ impl Kernels {
             csc_inner: job.c_inner as u32,
             _pad: 0,
         };
-        let params = arena.upload_bytes(gpu, &[64], bytemuck::bytes_of(&dims), "gemm.dims")?;
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
         let per_batch_out = job.m * job.n;
         // Batch 0's block is bound for the plain form; the batched one needs the
         // whole tensor because its gather offsets into each batch's own block.
@@ -909,7 +916,7 @@ impl Kernels {
         // those strides come from uninitialised arena memory. Single-batch jobs
         // never noticed (their batch base is zero), so the first batched caller
         // of this entry point was the one that found it.
-        let params = arena.upload_bytes(gpu, &[64], bytemuck::bytes_of(&dims), "gemm.dims")?;
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
 
         // The plain pipeline hard-codes a zero batch base, so it is only valid for
         // a single batch; everything else takes a batched form, which covers
@@ -1010,7 +1017,7 @@ impl Kernels {
             csc_inner: 0,
             _pad: 0,
         };
-        let params = arena.upload_bytes(gpu, &[16], bytemuck::bytes_of(&dims), "gemm.dims")?;
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
         // The grid has to follow whichever pipeline was chosen: the shader
         // derives `m0` from the workgroup id and its own `BM`, so a 256-row
         // kernel dispatched on a 128-row grid computes half the rows.
@@ -1435,23 +1442,18 @@ impl Kernels {
     ) -> Result<()> {
         let row_stride = 3 * heads * dim_head;
         let total_rows = bands * frames;
-        let params0 = arena.upload_bytes(
-            gpu,
-            &[4],
-            bytemuck::cast_slice(&[
-                frames as u32,
-                row_stride as u32,
-                dim_head as u32,
-                head_begin as u32,
-            ]),
-            "rope.dims0",
-        )?;
-        let params1 = arena.upload_bytes(
-            gpu,
-            &[4],
-            bytemuck::cast_slice(&[total_rows as u32, head_count as u32, 0u32, 0u32]),
-            "rope.dims1",
-        )?;
+        let params0 = gpu.push_uniform(bytemuck::cast_slice(&[
+            frames as u32,
+            row_stride as u32,
+            dim_head as u32,
+            head_begin as u32,
+        ]))?;
+        let params1 = gpu.push_uniform(bytemuck::cast_slice(&[
+            total_rows as u32,
+            head_count as u32,
+            0u32,
+            0u32,
+        ]))?;
         let group = bind_group(
             gpu,
             "rope",
@@ -3161,6 +3163,21 @@ impl Kernels {
         scale: f32,
     ) -> Result<()> {
         let params = self.params(gpu, arena, [rows as u32, cols as u32, scale.to_bits(), 0])?;
+        if let Some(pipeline) = self.softmax_scaled_warp.as_ref() {
+            let group = bind_group(
+                gpu,
+                "softmax",
+                &pipeline.get_bind_group_layout(0),
+                &[
+                    (&x.buffer, x.offset, (x.len() * 4) as u64),
+                    (&out.buffer, out.offset, (out.len() * 4) as u64),
+                    (&params.buffer, params.offset, 16),
+                ],
+            );
+            let (gx, gy) = row_grid(rows.div_ceil(shaders::SOFTMAX_WARP_ROWS_PER_WG));
+            recorder.dispatch("softmax", pipeline, &group, (gx, gy, 1));
+            return Ok(());
+        }
         let group = bind_group(
             gpu,
             "softmax",
@@ -3235,7 +3252,7 @@ impl Kernels {
             heads: heads as u32,
             scale_bits: scale.to_bits(),
         };
-        let params = arena.upload_bytes(gpu, &[8], bytemuck::bytes_of(&dims), "flash.dims")?;
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
         let group = bind_group(
             gpu,
             "flash_attention",

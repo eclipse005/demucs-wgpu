@@ -927,6 +927,7 @@ impl Recorder {
         if self.timing.is_some() {
             return self.submit_timed(gpu);
         }
+        gpu.flush_uniforms();
         let guard = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let started = std::time::Instant::now();
         gpu.queue.submit([self.encoder.finish()]);
@@ -937,6 +938,7 @@ impl Recorder {
             std::sync::atomic::Ordering::Relaxed,
         );
         HOST_TIMING_OPS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        gpu.reset_uniforms();
         if let Some(error) = validation {
             return Err(Error::Gpu(format!("compute pass failed validation: {error}")));
         }
@@ -959,10 +961,12 @@ impl Recorder {
             encoder.resolve_query_set(&t.query_set, 0..used, &t.resolve, 0);
             encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, (used as u64) * 8);
         }
+        gpu.flush_uniforms();
         let guard = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         gpu.queue.submit([encoder.finish()]);
         let poll = gpu.flush();
         let validation = pollster::block_on(guard.pop());
+        gpu.reset_uniforms();
         if let Some(error) = validation {
             return Err(Error::Gpu(format!("compute pass failed validation: {error}")));
         }
@@ -977,7 +981,9 @@ impl Recorder {
 
     /// Submits without waiting.
     pub fn submit_async(self, gpu: &Gpu) {
+        gpu.flush_uniforms();
         gpu.queue.submit([self.encoder.finish()]);
+        gpu.reset_uniforms();
     }
 
     /// Records a copy out of a device tensor into a host-visible staging buffer.
@@ -1000,7 +1006,10 @@ impl Recorder {
     /// overlap this exists for, and anything the pass gets wrong surfaces at the
     /// next device poll — which is where the caller waits for this index.
     pub fn submit_indexed(self, gpu: &Gpu) -> wgpu::SubmissionIndex {
-        gpu.queue.submit([self.encoder.finish()])
+        gpu.flush_uniforms();
+        let index = gpu.queue.submit([self.encoder.finish()]);
+        gpu.reset_uniforms();
+        index
     }
 }
 
