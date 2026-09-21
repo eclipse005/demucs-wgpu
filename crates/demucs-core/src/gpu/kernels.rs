@@ -873,6 +873,40 @@ impl Kernels {
                 flops * repeats as f64 / elapsed / 1e12
             );
         }
+
+        // What a submission boundary costs: the same dispatches, one per submit,
+        // each with the wait the chunk loop pays. The difference against the
+        // batched form is the fixed cost the chunk loop can only avoid by
+        // submitting less often.
+        let (_, pipeline) = &pipelines[0];
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
+        let group = bind_group(
+            gpu,
+            "plateau_probe_single",
+            &pipeline.get_bind_group_layout(0),
+            &[
+                (&a.buffer, a.offset, (a.len() * 4) as u64),
+                (&b.buffer, b.offset, (b.len() * 4) as u64),
+                (&c.buffer, c.offset, (c.len() * 4) as u64),
+                (&params.buffer, params.offset, 64),
+                (&bias.buffer, bias.offset, (bias.len() * 4) as u64),
+            ],
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..repeats {
+            let mut recorder = Recorder::new(gpu);
+            recorder.dispatch("probe_single", pipeline, &group, grid);
+            recorder.submit(gpu)?;
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| Error::Gpu(format!("probe poll: {e}")))?;
+        }
+        let per_submit = started.elapsed().as_secs_f64() / repeats as f64;
+        println!(
+            "  submission boundary: {:.3} ms per 1-dispatch submit ({:.2} TFLOP/s)",
+            per_submit * 1e3,
+            flops / per_submit / 1e12
+        );
         Ok(())
     }
 
