@@ -1712,6 +1712,63 @@ fn transpose(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id
     )
 }
 
+/// [`transpose`] with four elements per thread.
+///
+/// The elementwise form is *bound by its own address arithmetic*, not by memory:
+/// each element pays two divisions and two modulos on `(batch, rows, cols,
+/// width)` — about ten instructions for one load and one store — and the
+/// transposes that matter in this model (`width` = `d_head` 64 for the
+/// attention's QKV split, `width` = `dim` 512 for the cross-transformer's output
+/// flip) run at ~4x their bandwidth floor. Four consecutive `d` values share the
+/// whole decode, and because `d` is the innermost axis on *both* sides the four
+/// are contiguous both ways: one `vec4` load and one `vec4` store replace eight
+/// scalar accesses.
+///
+/// Requires `width % 4 == 0` and 16-byte-aligned operands — with `width` a
+/// multiple of four, a thread's four consecutive `d` values start at a multiple
+/// of four, and both buffers' bases do too; [`Kernels::transpose`] checks all
+/// three and falls back to the scalar form otherwise, so this is not a
+/// precondition its callers have to know about.
+pub fn transpose_wide() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> Out: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> gd: vec4<u32>;  // batch, rows, cols, width
+
+const GRID_X: u32 = 65535u;
+
+@compute @workgroup_size({threads})
+fn transpose_wide(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    // `i` indexes vec4 slots; `width % 4 == 0` is what makes the four elements a
+    // thread owns stay inside one `(b, row, col)` run.
+    let i = (wid.y * GRID_X + wid.x) * {threads}u + lid.x;
+    let plane = gd.y * gd.z * gd.w;
+    if (i * 4u >= gd.x * plane) {{ return; }}
+    let e = i * 4u;
+    let b = e / plane;
+    let rest = e % plane;
+    let width = gd.w;
+    let row = rest / (gd.z * width);
+    let tail = rest % (gd.z * width);
+    let col = tail / width;
+    let d = tail % width;
+    let out_plane = gd.z * gd.y * gd.w;
+    Out[(b * out_plane + (col * gd.y + row) * width + d) / 4u] = X[i];
+}}
+"#,
+        threads = ROW_THREADS
+    )
+}
+
+/// Whether [`transpose_wide`] may be used. `DEMUCS_TRANSPOSE_WIDE=0` keeps the
+/// scalar form, which is how the two were compared.
+pub fn transpose_wide_on() -> bool {
+    std::env::var("DEMUCS_TRANSPOSE_WIDE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 /// im2col gather for the conv family: `(batch, channels, h, w)` in,
 /// `(batch, k, positions)` out, with `k = channels * kh * kw` in `(ic, ky, kx)`
 /// order and `positions = out_h * out_w` in `(oy, ox)` order.

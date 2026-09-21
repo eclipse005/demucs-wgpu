@@ -388,6 +388,9 @@ pub struct Kernels {
     /// Four-lane variant, used when the element count is a multiple of four.
     add_in_place_vec4: wgpu::ComputePipeline,
     transpose: wgpu::ComputePipeline,
+    /// The same permutation with four elements a thread, for the widths and
+    /// alignments `shaders::transpose_wide` requires.
+    transpose_wide: wgpu::ComputePipeline,
     im2col: wgpu::ComputePipeline,
     /// `x = 0` over a range, on the device (see the shader's note on why the
     /// host-side clear is not an option at conv sizes).
@@ -632,6 +635,11 @@ impl Kernels {
                 "add_in_place_vec4",
             )?,
             transpose: gpu.pipeline("transpose", &shaders::transpose(), "transpose")?,
+            transpose_wide: gpu.pipeline(
+                "transpose_wide",
+                &shaders::transpose_wide(),
+                "transpose_wide",
+            )?,
             im2col: gpu.pipeline("im2col", &shaders::im2col(), "im2col")?,
             fill_zero: gpu.pipeline("fill_zero", &shaders::fill_zero(), "fill_zero")?,
             crop_rows: gpu.pipeline("crop_rows", &shaders::crop_rows(), "crop_rows")?,
@@ -4453,18 +4461,31 @@ impl Kernels {
             arena,
             [batch as u32, rows as u32, cols as u32, width as u32],
         )?;
+        // Four elements a thread where the innermost run allows it: the `vec4`
+        // form has to have its four elements inside one `(b, row, col)` run and
+        // its operands 16-byte aligned, which is exactly what
+        // `shaders::transpose_wide` documents. Anything else stays scalar.
+        let wide = shaders::transpose_wide_on()
+            && width % 4 == 0
+            && x.offset % 16 == 0
+            && out.offset % 16 == 0;
+        let (pipeline, per_thread) = if wide {
+            (&self.transpose_wide, 4)
+        } else {
+            (&self.transpose, 1)
+        };
         let group = bind_group(
             gpu,
             "transpose",
-            &self.transpose.get_bind_group_layout(0),
+            &pipeline.get_bind_group_layout(0),
             &[
                 (&x.buffer, x.offset, (x.len() * 4) as u64),
                 (&out.buffer, out.offset, (out.len() * 4) as u64),
                 (&params.buffer, params.offset, 16),
             ],
         );
-        let (gx, gy) = row_grid(elements.div_ceil(ROW_THREADS));
-        recorder.dispatch("transpose", &self.transpose, &group, (gx, gy, 1));
+        let (gx, gy) = row_grid(elements.div_ceil(per_thread * ROW_THREADS));
+        recorder.dispatch("transpose", pipeline, &group, (gx, gy, 1));
         Ok(())
     }
 
