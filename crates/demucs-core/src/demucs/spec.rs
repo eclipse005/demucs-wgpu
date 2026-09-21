@@ -255,7 +255,18 @@ pub fn pack_complex_as_channels(z: &Array4<Complex32>) -> Array4<f32> {
 
 /// `_mask`'s inverse packing: `(b, 4s, fr, t)` real to `(b, s, 2, fr, t)` complex
 /// via `view(b, s, -1, 2, fr, t).permute(0, 1, 2, 4, 5, 3)`.
+///
+/// One output plane per (source, channel) pair, each of them two input planes
+/// interleaved, so the planes can be filled in parallel from contiguous runs.
+/// The five-deep indexing loop this replaces ran 5.6 M bounds-checked 5-D reads
+/// and writes on one thread, and the array it filled was zeroed first: 45 MB of
+/// memset before a pass that overwrites every element.
+///
+/// SAFETY: every element of the buffer is written below before any is read —
+/// same contract as `demucs::ops::uninit_array`. `DEMUCS_ZERO_OUTPUTS=1`
+/// restores the zero fill.
 pub fn unpack_channels_as_complex(x: &Array4<f32>, sources: usize) -> Result<Array5<Complex32>> {
+    use rayon::prelude::*;
     let (b, channels, fr, t) = x.dim();
     if channels != sources * 4 {
         return Err(Error::Shape(format!(
@@ -263,29 +274,86 @@ pub fn unpack_channels_as_complex(x: &Array4<f32>, sources: usize) -> Result<Arr
             sources * 4
         )));
     }
-    let mut out = Array5::<Complex32>::zeros((b, sources, 2, fr, t));
-    for bi in 0..b {
-        for si in 0..sources {
-            for ci in 0..2 {
-                for f in 0..fr {
-                    for frame in 0..t {
-                        out[[bi, si, ci, f, frame]] = Complex32::new(
-                            x[[bi, si * 4 + ci * 2, f, frame]],
-                            x[[bi, si * 4 + ci * 2 + 1, f, frame]],
-                        );
-                    }
-                }
+    let source = x.as_slice().ok_or_else(|| {
+        Error::Shape("unpack_channels_as_complex needs a standard-layout input".into())
+    })?;
+    let mut out = uninit_complex_array5((b, sources, 2, fr, t));
+    let plane = fr * t;
+    out.as_slice_mut()
+        .ok_or_else(|| {
+            Error::Shape("unpack_channels_as_complex needs a standard-layout output".into())
+        })?
+        .par_chunks_mut(plane)
+        .enumerate()
+        .for_each(|(index, target)| {
+            let bi = index / (sources * 2);
+            let si = (index / 2) % sources;
+            let ci = index % 2;
+            let base = (bi * channels + si * 4 + ci * 2) * plane;
+            let real = &source[base..base + plane];
+            let imag = &source[base + plane..base + 2 * plane];
+            for (slot, (re, im)) in target.iter_mut().zip(real.iter().zip(imag.iter())) {
+                *slot = Complex32::new(*re, *im);
             }
-        }
-    }
+        });
     Ok(out)
 }
 
 /// The two `F.pad` calls `_ispec` performs, as one helper:
 /// `(b, s, c, fr, t) -> (b, s, c, fr + 1, t + 4)`.
+///
+/// The padding lands inside the output's rows, so each row of the output is one
+/// contiguous run of the input: the copy parallelises over planes and rows. The
+/// extra bin and the two-element borders are written out as zeros here rather
+/// than by zeroing the whole 45 MB first.
+///
+/// SAFETY: every element is written (a copied middle and an explicit zero
+/// border) before any is read.
 pub fn pad_for_ispec(z: &Array5<Complex32>) -> Array5<Complex32> {
+    use rayon::prelude::*;
     let (b, s, c, fr, t) = z.dim();
-    let mut out = Array5::<Complex32>::zeros((b, s, c, fr + 1, t + 4));
-    out.slice_mut(s![.., .., .., ..fr, 2..2 + t]).assign(z);
+    let mut out = uninit_complex_array5((b, s, c, fr + 1, t + 4));
+    let width = t + 4;
+    let zero = Complex32::new(0.0, 0.0);
+    if let (Some(source), Some(target)) = (z.as_slice(), out.as_slice_mut()) {
+        target
+            .par_chunks_mut((fr + 1) * width)
+            .enumerate()
+            .for_each(|(index, plane)| {
+                let base = index * fr * t;
+                for (f, row) in plane.chunks_mut(width).enumerate() {
+                    if f < fr {
+                        row[..2].fill(zero);
+                        row[2..2 + t]
+                            .copy_from_slice(&source[base + f * t..base + (f + 1) * t]);
+                        row[2 + t..].fill(zero);
+                    } else {
+                        row.fill(zero);
+                    }
+                }
+            });
+    } else {
+        out.fill(zero);
+        out.slice_mut(s![.., .., .., ..fr, 2..2 + t]).assign(z);
+    }
     out
+}
+
+/// An `Array5<Complex32>` whose elements are not initialised yet.
+///
+/// SAFETY: every element must be written before any is read — same contract as
+/// `demucs::ops::uninit_array`, and `DEMUCS_ZERO_OUTPUTS=1` / `DEMUCS_UNINIT=0`
+/// restore the zero fill for a same-binary A/B.
+fn uninit_complex_array5(shape: (usize, usize, usize, usize, usize)) -> Array5<Complex32> {
+    let len = shape.0 * shape.1 * shape.2 * shape.3 * shape.4;
+    let zeroed = std::env::var("DEMUCS_ZERO_OUTPUTS").is_ok_and(|v| v != "0")
+        || std::env::var("DEMUCS_UNINIT").is_ok_and(|v| v == "0");
+    if zeroed {
+        return Array5::<Complex32>::zeros(shape);
+    }
+    let mut values = Vec::<Complex32>::with_capacity(len);
+    unsafe {
+        values.set_len(len);
+        Array5::from_shape_vec_unchecked(shape, values)
+    }
 }

@@ -481,8 +481,15 @@ impl Htdemucs {
         }
         let waveform = {
             let _scope = profile::scope("epilogue");
-            let zout = unpack_channels_as_complex(&x, sources)?;
-            let zout = pad_for_ispec(&zout);
+            let zout = {
+                let _s = profile::scope("spec.unpack");
+                unpack_channels_as_complex(&x, sources)?
+            };
+            let zout = {
+                let _s = profile::scope("spec.pad");
+                pad_for_ispec(&zout)
+            };
+            let _s = profile::scope("spec.ispec");
             self.spec.ispec(&zout, training_length, 0)?
         };
         if trace.wants("freq_ispec") {
@@ -706,7 +713,10 @@ impl Htdemucs {
 
         let (batch, channels, freqs, frames) = gated.dim();
         let mut flat = uninit_array((batch * freqs, channels, frames));
-        channels_to_leading_freq_into(&gated, &mut flat)?;
+        {
+            let _scope = profile::scope("dec.permute.in");
+            channels_to_leading_freq_into(&gated, &mut flat)?;
+        }
         flat = {
             let _scope = profile::scope("dec.dconv");
             dconv_forward(&layer.dconv, &flat)?
@@ -715,7 +725,10 @@ impl Htdemucs {
             trace.record(&format!("{name}.dconv"), flat.view().into_dyn());
         }
         let mut pre = uninit_array((batch, channels, freqs, frames));
-        leading_freq_to_channels_into(&flat, batch, channels, freqs, &mut pre)?;
+        {
+            let _scope = profile::scope("dec.permute.out");
+            leading_freq_to_channels_into(&flat, batch, channels, freqs, &mut pre)?;
+        }
 
         let upsampled = {
             let _scope = profile::scope("dec.conv_tr");
@@ -734,8 +747,12 @@ impl Htdemucs {
         // The frequency crop is unconditional in the reference; `length` there is
         // the *frame* count, which only the waveform branch consumes.
         let _ = length;
-        let mut z = upsampled.slice(s![.., .., pad..bins - pad, ..]).to_owned();
+        let mut z = {
+            let _scope = profile::scope("dec.crop");
+            upsampled.slice(s![.., .., pad..bins - pad, ..]).to_owned()
+        };
         if !last {
+            let _scope = profile::scope("dec.gelu");
             gelu_in_place(z.as_slice_mut().expect("standard layout"));
         }
         Ok((z, pre))

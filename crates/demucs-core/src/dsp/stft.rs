@@ -176,10 +176,16 @@ impl Stft {
                 let row = &rows[b];
                 let mut scratch = vec![Complex32::default(); self.forward.get_inplace_scratch_len()];
                 let mut buffer = vec![Complex32::default(); frame_len];
-                for i in 0..frame_len {
-                    buffer[i] = Complex32::new(row[start + i] * self.window[i], 0.0);
+                {
+                    let _scope = crate::demucs::host::profile::scope("fft.window");
+                    for i in 0..frame_len {
+                        buffer[i] = Complex32::new(row[start + i] * self.window[i], 0.0);
+                    }
                 }
-                self.forward.process_with_scratch(&mut buffer, &mut scratch);
+                {
+                    let _scope = crate::demucs::host::profile::scope("fft.transform");
+                    self.forward.process_with_scratch(&mut buffer, &mut scratch);
+                }
                 buffer.truncate(bins);
                 ((b, f), buffer)
             })
@@ -255,22 +261,28 @@ impl Stft {
                 let mut y = vec![0.0f32; expected];
                 let mut envelope = vec![0.0f32; expected];
                 for f in 0..frames {
-                    // Rebuild the full Hermitian spectrum from the one-sided half.
-                    buffer[0] = spec[[b, 0, f]];
-                    for k in 1..bins {
-                        let value = spec[[b, k, f]];
-                        buffer[k] = value;
-                        buffer[n_fft - k] = value.conj();
+                    {
+                        let _scope = crate::demucs::host::profile::scope("ispec.mirror");
+                        buffer[0] = spec[[b, 0, f]];
+                        for k in 1..bins {
+                            let value = spec[[b, k, f]];
+                            buffer[k] = value;
+                            buffer[n_fft - k] = value.conj();
+                        }
                     }
-
-                    self.inverse.process_with_scratch(&mut buffer, &mut scratch);
-
-                    let offset = f * hop;
-                    let inv_n = norm_scale / n_fft as f32;
-                    for i in 0..n_fft {
-                        let w = self.window[i];
-                        y[offset + i] += buffer[i].re * inv_n * w;
-                        envelope[offset + i] += w * w;
+                    {
+                        let _scope = crate::demucs::host::profile::scope("ispec.ifft");
+                        self.inverse.process_with_scratch(&mut buffer, &mut scratch);
+                    }
+                    {
+                        let _scope = crate::demucs::host::profile::scope("ispec.accum");
+                        let offset = f * hop;
+                        let inv_n = norm_scale / n_fft as f32;
+                        for i in 0..n_fft {
+                            let w = self.window[i];
+                            y[offset + i] += buffer[i].re * inv_n * w;
+                            envelope[offset + i] += w * w;
+                        }
                     }
                 }
 
