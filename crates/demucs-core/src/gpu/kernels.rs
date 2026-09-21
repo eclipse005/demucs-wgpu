@@ -445,6 +445,9 @@ pub struct Kernels {
     /// folds the `exp` into its own staging (see
     /// [`Kernels::softmax_stats`]).
     softmax_stats_warp: Option<wgpu::ComputePipeline>,
+    /// The same two statistics on a shared-memory tree, for adapters that cannot
+    /// promise a 32-lane subgroup. One workgroup per row.
+    softmax_stats_tree: wgpu::ComputePipeline,
     /// Fused attention for `dim_head == 64`, replacing the score-matrix path.
     flash_attention: wgpu::ComputePipeline,
     /// 4096-point inverse real FFT, one workgroup per spectrogram frame.
@@ -735,6 +738,11 @@ impl Kernels {
             } else {
                 None
             },
+            softmax_stats_tree: gpu.pipeline(
+                "softmax_stats_tree",
+                &shaders::softmax_stats_tree(),
+                "softmax_stats_tree",
+            )?,
             flash_attention: gpu.pipeline(
                 "flash_attention",
                 &shaders::flash_attention(),
@@ -1243,10 +1251,15 @@ impl Kernels {
         cols: usize,
         scale: f32,
     ) -> Result<()> {
-        let Some(pipeline) = self.softmax_stats_warp.as_ref() else {
-            return Err(Error::Gpu(
-                "softmax stats needs the 32-lane subgroup reduction".into(),
-            ));
+        // One workgroup per row in the tree form, `SOFTMAX_WARP_ROWS_PER_WG` rows
+        // per workgroup in the warp form: the two kernels' row formulas differ,
+        // so the grid has to follow whichever one runs. The tree form is the
+        // fallback for adapters that cannot promise a 32-lane subgroup, and it is
+        // not optional here — the folded softmax has nowhere else to get its
+        // statistics.
+        let (pipeline, rows_per_wg) = match self.softmax_stats_warp.as_ref() {
+            Some(pipeline) => (pipeline, shaders::SOFTMAX_WARP_ROWS_PER_WG),
+            None => (&self.softmax_stats_tree, 1),
         };
         if stats.len() < 2 * rows {
             return Err(Error::Shape(format!(
@@ -1266,7 +1279,7 @@ impl Kernels {
                 (&params.buffer, params.offset, 16),
             ],
         );
-        let (gx, gy) = row_grid(rows.div_ceil(shaders::SOFTMAX_WARP_ROWS_PER_WG));
+        let (gx, gy) = row_grid(rows.div_ceil(rows_per_wg));
         recorder.dispatch("softmax_stats", pipeline, &group, (gx, gy, 1));
         Ok(())
     }

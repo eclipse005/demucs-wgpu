@@ -2964,6 +2964,100 @@ fn softmax_stats(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
 /// Columns one lane of the warp softmax covers, i.e. the widest row it takes.
 pub const SOFTMAX_WARP_COLS: usize = 64;
 
+/// [`softmax_stats_warp`] on a shared-memory tree instead of a 32-lane subgroup
+/// reduction: the same two statistics per row, for adapters that cannot promise
+/// a 32-lane subgroup.
+///
+/// The folded softmax is the one place where the statistics are *not* a step
+/// towards materialising probabilities — the `P·V` product reads them and
+/// applies them in its own `A` staging — so an adapter without the subgroup
+/// kernels has nowhere else to get them. Everything else in the softmax family
+/// already ships both forms (`softmax` / `softmax_warp` and their scaled
+/// variants); this closes the gap, and it is why the iGPU could not run a
+/// forward at all.
+///
+/// One workgroup per row, `ROW_THREADS` lanes, `log2` halving steps; the
+/// per-lane scan and the online `(max, Σexp)` rescale are the warp kernel's
+/// own, so only the association of the final combine differs — and this form is
+/// only reached where the warp form cannot run at all.
+pub fn softmax_stats_tree() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Stats: array<f32>;  // 2 per row: max, 1/sum
+@group(0) @binding(2) var<uniform> gd: vec4<u32>;  // rows, cols, scale bits, _
+
+const THREADS: u32 = {threads}u;
+const ROW_GRID_X: u32 = {grid_x}u;
+
+var<workgroup> red: array<vec2<f32>, {threads}>;
+
+@compute @workgroup_size({threads})
+fn softmax_stats_tree(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let tid = lid.x;
+    let cols = gd.y;
+    let scale = bitcast<f32>(gd.z);
+    let row = wid.y * ROW_GRID_X + wid.x;
+    let safe_row = min(row, gd.x - 1u);
+    let base = safe_row * cols;
+
+    // The warp kernel's scan, one workgroup wide: each lane owns four
+    // consecutive columns and steps by the block, then mops up the tail — which
+    // only the lane whose stride lands inside the last partial group reaches, so
+    // no element is counted twice.
+    var local_max = -3.402823e38;
+    var local_sum = 0.0;
+    let stride = THREADS * 4u;
+    var i = tid * 4u;
+    loop {{
+        if (i + 4u > cols) {{ break; }}
+        let x0 = X[base + i] * scale;
+        let x1 = X[base + i + 1u] * scale;
+        let x2 = X[base + i + 2u] * scale;
+        let x3 = X[base + i + 3u] * scale;
+        let m2 = max(local_max, max(max(x0, x1), max(x2, x3)));
+        let e = exp(local_max - m2);
+        local_sum = local_sum * e + exp(x0 - m2) + exp(x1 - m2) + exp(x2 - m2) + exp(x3 - m2);
+        local_max = m2;
+        i = i + stride;
+    }}
+    loop {{
+        if (i >= cols) {{ break; }}
+        let x = X[base + i] * scale;
+        let m2 = max(local_max, x);
+        local_sum = local_sum * exp(local_max - m2) + exp(x - m2);
+        local_max = m2;
+        i = i + 1u;
+    }}
+    red[tid] = vec2<f32>(local_max, local_sum);
+    workgroupBarrier();
+    var width = THREADS / 2u;
+    loop {{
+        if (width == 0u) {{ break; }}
+        if (tid < width) {{
+            let a = red[tid];
+            let b = red[tid + width];
+            let m = max(a.x, b.x);
+            red[tid] = vec2<f32>(m, a.y * exp(a.x - m) + b.y * exp(b.x - m));
+        }}
+        workgroupBarrier();
+        width = width / 2u;
+    }}
+    if (tid == 0u && row < gd.x) {{
+        let inv = select(0.0, 1.0 / red[0].y, red[0].y > 0.0);
+        Stats[safe_row * 2u] = red[0].x;
+        Stats[safe_row * 2u + 1u] = inv;
+    }}
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X,
+    )
+}
+
 /// Fused attention for `dim_head == 64`: `softmax(Q Kᵀ √d⁻¹ V` in one dispatch,
 /// never materialising the score matrix.
 ///
