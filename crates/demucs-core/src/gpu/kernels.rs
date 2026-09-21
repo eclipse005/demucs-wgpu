@@ -368,6 +368,8 @@ pub struct Kernels {
     /// Four-lane variant, used when the element count is a multiple of four.
     gelu_in_place_vec4: wgpu::ComputePipeline,
     glu: wgpu::ComputePipeline,
+    /// The DConv's GLU and its per-channel LayerScale in one pass.
+    glu_channel_affine: wgpu::ComputePipeline,
     sigmoid_gate: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     add_in_place: wgpu::ComputePipeline,
@@ -555,6 +557,11 @@ impl Kernels {
                 "gelu_in_place_vec4",
             )?,
             glu: gpu.pipeline("glu", &shaders::glu(), "glu")?,
+            glu_channel_affine: gpu.pipeline(
+                "glu_channel_affine",
+                &shaders::glu_channel_affine(),
+                "glu_channel_affine",
+            )?,
             sigmoid_gate: gpu.pipeline(
                 "sigmoid_gate",
                 &shaders::sigmoid_gate(),
@@ -1622,6 +1629,51 @@ impl Kernels {
         let out = arena.tensor(gpu, &[rows, half], "glu.out")?;
         self.glu_into(gpu, arena, recorder, x, &out, rows, half)?;
         Ok(out)
+    }
+
+    /// The DConv's `nn.GLU` and the `nn.LayerScale` that follows it in one pass:
+    /// `out = glu(x) * scale + shift`.
+    ///
+    /// The two are adjacent elementwise passes over the same activation, so the
+    /// fused store produces exactly what the pair does — the GLU's value is the
+    /// same expression and the scale/shift is the same arithmetic, applied on
+    /// the way out instead of on a second read-modify-write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn glu_channel_affine_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        x: &DevTensor,
+        scale: &DevTensor,
+        shift: &DevTensor,
+        out: &DevTensor,
+        rows: usize,
+        half: usize,
+        channels: usize,
+        plane: usize,
+    ) -> Result<()> {
+        let count = rows * half;
+        let params = self.params(
+            gpu,
+            arena,
+            [rows as u32, half as u32, channels as u32, plane as u32],
+        )?;
+        let group = bind_group(
+            gpu,
+            "glu_channel_affine",
+            &self.glu_channel_affine.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (x.len() * 4) as u64),
+                (&out.buffer, out.offset, (count * 4) as u64),
+                (&scale.buffer, scale.offset, (scale.len() * 4) as u64),
+                (&shift.buffer, shift.offset, (shift.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+            ],
+        );
+        let (gx, gy) = row_grid(count.div_ceil(ROW_THREADS));
+        recorder.dispatch("glu_channel_affine", &self.glu_channel_affine, &group, (gx, gy, 1));
+        Ok(())
     }
 
     /// Same, into a caller-provided output.

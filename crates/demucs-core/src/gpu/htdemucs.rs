@@ -1121,22 +1121,51 @@ fn dconv_stage(
                 eps: NORM_EPS,
             },
         )?;
-        let gated = kernels.glu(gpu, arena, &mut recorder, &normed2, rows, layer.channels * time)?;
-        if trace.wants(&format!("{name}.glu")) {
-            record_tensor(gpu, &mut recorder, &gated, &format!("{name}.glu"), trace)?;
-        }
-        kernels.channel_affine_act_in_place(
-            gpu,
-            arena,
-            recorder,
-            &gated,
-            &layer.gamma,
-            &layer.gamma_zero,
-            rows,
-            layer.channels,
-            time,
-            Activation::Identity,
-        )?;
+        // The GLU and the LayerScale that follows it are adjacent elementwise
+        // passes over the same activation, so they ride one dispatch — unless a
+        // trace wants the GLU's own output, which the layer-by-layer check
+        // compares against the host's.
+        let want_glu = trace.wants(&format!("{name}.glu"));
+        let gated = if want_glu || !shaders::fuse_glu_scale() {
+            let gated =
+                kernels.glu(gpu, arena, &mut recorder, &normed2, rows, layer.channels * time)?;
+            if want_glu {
+                record_tensor(gpu, &mut recorder, &gated, &format!("{name}.glu"), trace)?;
+            }
+            kernels.channel_affine_act_in_place(
+                gpu,
+                arena,
+                recorder,
+                &gated,
+                &layer.gamma,
+                &layer.gamma_zero,
+                rows,
+                layer.channels,
+                time,
+                Activation::Identity,
+            )?;
+            gated
+        } else {
+            let gated = arena.tensor(
+                gpu,
+                &[rows, layer.channels, time],
+                &format!("{name}.glu"),
+            )?;
+            kernels.glu_channel_affine_into(
+                gpu,
+                arena,
+                recorder,
+                &normed2,
+                &layer.gamma,
+                &layer.gamma_zero,
+                &gated,
+                rows,
+                layer.channels * time,
+                layer.channels,
+                time,
+            )?;
+            gated
+        };
         if trace.wants(&format!("{name}.out")) {
             record_tensor(gpu, &mut recorder, &gated, &format!("{name}.out"), trace)?;
         }

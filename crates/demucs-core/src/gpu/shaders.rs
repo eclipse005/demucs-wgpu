@@ -105,6 +105,16 @@ pub fn group_norm_combine_stats() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the DConv's GLU and the LayerScale that follows it are one dispatch.
+///
+/// `DEMUCS_FUSE_GLU_SCALE=0` restores the two-step form, which is how the two
+/// were compared; a trace that wants the GLU's own output also takes it.
+pub fn fuse_glu_scale() -> bool {
+    std::env::var("DEMUCS_FUSE_GLU_SCALE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 /// Segment count below which the apply replays the partials itself instead of
 /// taking a `group_norm_combine` dispatch first.
 ///
@@ -1335,6 +1345,48 @@ fn glu(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid:
 }}
 "#,
         threads = ROW_THREADS
+    )
+}
+
+/// `out = glu(x) * scale + shift` in one pass: the DConv's GLU is immediately
+/// followed by its LayerScale, and the two between them read and write the whole
+/// activation twice.
+///
+/// Bit-identical to the pair: the same `sig(X[base + half + col]) * X[base + col]`
+/// per element, then the same `value * Scale[channel] + Shift[channel]` the
+/// separate affine applies — that one is pure elementwise, so folding it into
+/// the producer's store changes no rounding.
+pub fn glu_channel_affine() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(2) var<storage, read> Scale: array<f32>;
+@group(0) @binding(3) var<storage, read> Shift: array<f32>;
+@group(0) @binding(4) var<uniform> gd: vec4<u32>;  // rows, half, channels, plane
+
+const GRID_X: u32 = 65535u;
+
+@compute @workgroup_size({threads})
+fn glu_channel_affine(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let i = (wid.y * GRID_X + wid.x) * {threads}u + lid.x;
+    // `half` is the GLU's half, `channels * plane`; the LayerScale's channel
+    // index is the one `channel_affine_act_in_place` uses, `(i / plane) % channels`.
+    let half = gd.y;
+    let channels = gd.z;
+    let plane = gd.w;
+    let total = gd.x * half;
+    if (i >= total) {{ return; }}
+    let row = i / half;
+    let col = i % half;
+    let base = row * half * 2u;
+    let gate = X[base + half + col];
+    let value = X[base + col] * (1.0 / (1.0 + exp(-gate)));
+    let channel = (i / plane) % channels;
+    Out[i] = value * Scale[channel] + Shift[channel];
+}}
+"#,
+        threads = ROW_THREADS,
     )
 }
 
