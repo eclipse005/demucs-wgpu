@@ -1155,6 +1155,15 @@ fn multi_head_attention(
         let chunk = n_q * d_head;
         // Each (batch, head) owns one disjoint chunk of the output, so the
         // chunks can be written in parallel with no synchronisation.
+        //
+        // Throttling how many heads are in flight at once was tried here — every
+        // `(batch, head)` pair on the 2688-token streams owns a 28.9 MB score
+        // matrix that the softmax sweeps five times and the AV product then
+        // reads, so eight at once is 231 MB of live data against a 36 MB L3 —
+        // and it loses: with `DEMUCS_ATTN_HEADS=1` (run one head at a time) the
+        // heads stage is 232.0 ms against 212.6 for eight, three runs each,
+        // segments 1013.6 against 963.4. The parallelism the score block is
+        // computed with is worth more than any residency the throttle buys.
         dst.par_chunks_mut(chunk)
             .enumerate()
             .for_each(|(bh, slot)| {
