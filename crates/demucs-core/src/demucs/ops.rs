@@ -11,15 +11,28 @@ use crate::demucs::weights::ConvW;
 use crate::error::{Error, Result};
 use crate::ops::{gelu_erf, softmax_in_place, Linear};
 
-/// Output positions per GEMM tile when a convolution is lowered to im2col.
-const POSITIONS_PER_TILE: usize = 8192;
-
-/// Largest patch matrix built in one go, in elements (128 MB).
+/// Target size of the im2col patch matrix, in elements.
 ///
 /// The gather is the convolution's memory cost: `k * positions` floats written
-/// and then read by the GEMM. Blocking keeps that bounded while still giving the
-/// parallel loops enough work per block.
-const PATCH_BLOCK_ELEMENTS: usize = 32 << 20;
+/// and then read by the GEMM. Blocking by *output rows* bounded that only for
+/// the wide-`k` convolutions — the frequency branch's `3x3` rewrites have
+/// `k = ic * 9 = 432` and a 21504-wide row, so one row of patches is 37 MB and
+/// the 128 MB limit let a block hold three of them: the patch matrix was
+/// written to DRAM and read back, 297 MB each way per call. Tiling inside the
+/// row instead keeps the matrix in cache, which is where the GEMM wants it.
+/// `DEMUCS_PATCH_TILE=<elements>` overrides it (0 restores row blocking).
+fn patch_tile_elements() -> usize {
+    std::env::var("DEMUCS_PATCH_TILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PATCH_BLOCK_ELEMENTS)
+}
+
+/// Default patch tile, in elements (4 MiB of f32, which stays in L3 — the whole
+/// point of the tiling — while still leaving each GEMM big enough that the
+/// crate's per-call dispatch is not what the stage costs: at 1 MiB of patch the
+/// same convolutions get 15% slower, at 67 MiB 3% slower).
+const PATCH_BLOCK_ELEMENTS: usize = 1 << 20;
 
 /// `nn.Conv2d` with arbitrary stride/padding/dilation on a `(b, c, h, w)` input.
 ///
@@ -102,23 +115,18 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
     }
 
     let mut flat = uninit_vec(b * oc * plane);
-    let rows_per_block = (PATCH_BLOCK_ELEMENTS / (k * out_w).max(1)).max(1);
-    let blocks: Vec<(usize, usize)> = {
-        let mut blocks = Vec::new();
-        let mut row = 0;
-        while row < out_h {
-            let rows = rows_per_block.min(out_h - row);
-            blocks.push((row, rows));
-            row += rows;
-        }
-        blocks
-    };
+    // Positions per tile: enough to keep the parallel loops busy, small enough
+    // that `k * positions` floats stay in cache between the gather and the GEMM.
+    let tile = (patch_tile_elements() / k.max(1)).max(64);
 
     for bi in 0..b {
         let input = x.slice(s![bi, .., .., ..]);
-        for &(row0, rows_here) in &blocks {
-            let positions = rows_here * out_w;
-            // 1. im2col: one row of the patch matrix per (ic, ky, kx) tap.
+        let mut p0 = 0usize;
+        while p0 < plane {
+            let positions = tile.min(plane - p0);
+            // 1. im2col: one row of the patch matrix per (ic, ky, kx) tap, over
+            // the output positions `[p0, p0 + positions)`, which may start and
+            // end inside an output row.
             let mut patches = uninit_vec(k * positions);
             patches
                 .par_chunks_mut(positions)
@@ -128,13 +136,17 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
                     let tap = krow % (kh * kw);
                     let (ky, kx) = (tap / kw, tap % kw);
                     let src = input.slice(s![ic, .., ..]);
-                    let mut p = 0usize;
-                    for oy in row0..row0 + rows_here {
+                    let mut q = 0usize;
+                    while q < positions {
+                        let p = p0 + q;
+                        let oy = p / out_w;
+                        let ox0 = p % out_w;
+                        let run = (out_w - ox0).min(positions - q);
+                        let dst_row = &mut dst[q..q + run];
                         let iy = (oy * sh + ky * dh) as isize - ph as isize;
-                        let dst_row = &mut dst[p..p + out_w];
-                        p += out_w;
                         if iy < 0 || iy >= h as isize {
                             dst_row.fill(0.0);
+                            q += run;
                             continue;
                         }
                         let src_row = src.slice(s![iy as usize, ..]);
@@ -145,26 +157,30 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
                         // the one loop that is pure bandwidth — this copies the
                         // middle run whole and zero-fills the two ends.
                         if sw == 1 && dw == 1 {
-                            let lo = pw.saturating_sub(kx).min(out_w);
-                            let hi = out_w.min((width + pw).saturating_sub(kx));
-                            let hi = hi.max(lo);
-                            dst_row[..lo].fill(0.0);
-                            dst_row[hi..].fill(0.0);
+                            let lo = pw.saturating_sub(kx).min(out_w).max(ox0);
+                            let hi = out_w
+                                .min((width + pw).saturating_sub(kx))
+                                .min(ox0 + run)
+                                .max(lo);
+                            dst_row[..lo - ox0].fill(0.0);
+                            dst_row[hi - ox0..].fill(0.0);
                             if hi > lo {
                                 let from = lo + kx - pw;
                                 let run = src_row.slice(s![from..from + (hi - lo)]);
-                                dst_row[lo..hi].copy_from_slice(run.as_slice().unwrap());
+                                dst_row[lo - ox0..hi - ox0].copy_from_slice(run.as_slice().unwrap());
                             }
+                            q += run;
                             continue;
                         }
-                        for ox in 0..out_w {
-                            let ix = (ox * sw + kx * dw) as isize - pw as isize;
-                            dst_row[ox] = if ix < 0 || ix >= width as isize {
+                        for (i, slot) in dst_row.iter_mut().enumerate() {
+                            let ix = ((ox0 + i) * sw + kx * dw) as isize - pw as isize;
+                            *slot = if ix < 0 || ix >= width as isize {
                                 0.0
                             } else {
                                 src_row[ix as usize]
                             };
                         }
+                        q += run;
                     }
                 });
 
@@ -172,9 +188,9 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
             let patch_view =
                 ArrayView2::from_shape((k, positions), &patches).expect("exact size");
             let product = matmul(&weight, &patch_view);
+            let values = product.as_slice().expect("standard layout");
 
             // 3. bias and write-back, one contiguous run per output channel.
-            let base = bi * oc * plane + row0 * out_w;
             flat.par_chunks_mut(plane)
                 .enumerate()
                 .skip(bi * oc)
@@ -182,14 +198,13 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
                 .for_each(|(channel, dst)| {
                     let o = channel % oc;
                     let bias = w.bias[o];
-                    let values = &product.as_slice().expect("standard layout")
-                        [o * positions..(o + 1) * positions];
-                    let target = &mut dst[row0 * out_w..row0 * out_w + positions];
+                    let values = &values[o * positions..(o + 1) * positions];
+                    let target = &mut dst[p0..p0 + positions];
                     for (slot, value) in target.iter_mut().zip(values.iter()) {
                         *slot = *value + bias;
                     }
                 });
-            let _ = base;
+            p0 += positions;
         }
     }
     Array4::from_shape_vec((b, oc, out_h, out_w), flat).expect("the output shape matches")
