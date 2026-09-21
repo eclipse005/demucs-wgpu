@@ -715,6 +715,160 @@ impl Kernels {
         gpu.push_uniform(bytemuck::cast_slice(&values))
     }
 
+    /// Times the `nn.Linear` GEMM (the model's most expensive kernel family)
+    /// against two mutants of its own source.
+    ///
+    /// The plateau is the open item in the handoff: the square-tile GEMM
+    /// sustains ~3.3 TFLOP/s where a register-only FMA probe reaches 5.8, and
+    /// no tile arithmetic explains the gap. Two mutants split it in two --
+    /// `no_global` replaces every global `A`/`B` staging load with a constant
+    /// (the shared staging, the LDS reads, the barriers and the FMAs all stay),
+    /// and `no_barrier` drops only the `workgroupBarrier` calls. Both compute
+    /// nonsense; they are timed, never checked.
+    ///
+    /// Probe, not a path: driven by
+    /// `cargo test --release -p demucs-core --test gpu_gemm_plateau -- --ignored --nocapture`.
+    pub fn plateau_probe(
+        &self,
+        gpu: &Gpu,
+        repeats: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        // The Linear is single-batch, transposed, with the bias in the
+        // epilogue: `gemm_transb_plain_bias` is its pipeline.
+        let base = shaders::gemm_transb_plain_bias();
+        // Each global load is pointed at element zero rather than replaced by a
+        // constant: the bindings stay live (an auto layout drops what the
+        // shader stops using, and the bind group would then be invalid) and the
+        // loads still issue, but every one of them hits the same cache line.
+        let strip_loads = |source: &str| -> String {
+            let mut out = String::with_capacity(source.len());
+            for line in source.split_inclusive('\n') {
+                let mut rest = line;
+                loop {
+                    let hit = ["A[", "B["]
+                        .iter()
+                        .filter_map(|pat| rest.find(pat))
+                        .min();
+                    let Some(start) = hit else { break };
+                    let Some(len) = rest[start..].find(']') else {
+                        break;
+                    };
+                    out.push_str(&rest[..start]);
+                    out.push_str(&rest[start..start + 2]);
+                    out.push_str("0u]");
+                    rest = &rest[start + len + 1..];
+                }
+                out.push_str(rest);
+            }
+            out
+        };
+        let no_global = strip_loads(&base);
+        let no_barrier = base.replace("    workgroupBarrier();\n", "");
+        let loads = base.matches("A[").count() + base.matches("B[").count();
+        let barriers = base.matches("workgroupBarrier();").count();
+        println!(
+            "plateau probe {m}x{n}x{k}: rewrote {loads} global loads, removed {barriers} barriers"
+        );
+
+        let pipelines = [
+            ("real", gpu.pipeline("probe_real", &base, "gemm")?),
+            (
+                "no_global",
+                gpu.pipeline("probe_no_global", &no_global, "gemm")?,
+            ),
+            (
+                "no_barrier",
+                gpu.pipeline("probe_no_barrier", &no_barrier, "gemm")?,
+            ),
+        ];
+
+        let lda = pad_ceil(k, shaders::BK);
+        let ldb = pad_ceil(k, shaders::BN);
+        let job = GemmJob {
+            m,
+            n,
+            k,
+            lda,
+            ldb,
+            ldc: n,
+            batches: 1,
+            inner_count: 1,
+            a_outer: 0,
+            a_inner: 0,
+            b_outer: 0,
+            b_inner: 0,
+            c_outer: 0,
+            c_inner: 0,
+            transb: true,
+        };
+        let dims = GemmDims {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            lda: lda as u32,
+            ldb: ldb as u32,
+            ldc: n as u32,
+            inner_count: 1,
+            asa_outer: 0,
+            asa_inner: 0,
+            bsb_outer: 0,
+            bsb_inner: 0,
+            csc_outer: 0,
+            csc_inner: 0,
+            _pad: 0,
+        };
+        let mut arena = Arena::new(gpu, 1 << 30);
+        let a = arena.tensor(gpu, &[pad_ceil(m, shaders::BM) * lda], "probe.a")?;
+        let b = arena.tensor(gpu, &[pad_ceil(n, shaders::BN) * ldb], "probe.b")?;
+        let c = arena.tensor(gpu, &[m * n], "probe.c")?;
+        let bias = arena.tensor(gpu, &[n], "probe.bias")?;
+        let grid = job.grid_with(shaders::BM, shaders::BN);
+        let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
+
+        for (label, pipeline) in &pipelines {
+            let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
+            let group = bind_group(
+                gpu,
+                "plateau_probe",
+                &pipeline.get_bind_group_layout(0),
+                &[
+                    (&a.buffer, a.offset, (a.len() * 4) as u64),
+                    (&b.buffer, b.offset, (b.len() * 4) as u64),
+                    (&c.buffer, c.offset, (c.len() * 4) as u64),
+                    (&params.buffer, params.offset, 64),
+                    (&bias.buffer, bias.offset, (bias.len() * 4) as u64),
+                ],
+            );
+            let mut warm = Recorder::new(gpu);
+            warm.dispatch(label, pipeline, &group, grid);
+            warm.submit(gpu)?;
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| Error::Gpu(format!("probe warm-up poll: {e}")))?;
+
+            let started = std::time::Instant::now();
+            let mut recorder = Recorder::new(gpu);
+            for _ in 0..repeats {
+                recorder.dispatch(label, pipeline, &group, grid);
+            }
+            recorder.submit(gpu)?;
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| Error::Gpu(format!("probe poll: {e}")))?;
+            let elapsed = started.elapsed().as_secs_f64();
+            let per_dispatch = elapsed / repeats as f64;
+            println!(
+                "  {label:>10}: {:.3} ms/dispatch, {:.2} TFLOP/s",
+                per_dispatch * 1e3,
+                flops * repeats as f64 / elapsed / 1e12
+            );
+        }
+        Ok(())
+    }
+
     /// `out[m, n] = x[m, k] @ w[k, n]`.
     ///
     /// `w` must already be zero-padded to `(round_up(k, BK), round_up(n, BN))` and
