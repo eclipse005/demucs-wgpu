@@ -998,11 +998,12 @@ pub fn dconv_forward(branch: &DConvW, x: &Array3<f32>) -> Result<Array3<f32>> {
 /// `nn.LayerNorm` over the last axis of a `(b, t, c)` tensor.
 fn normalise_rows(x: &Array3<f32>, norm: &LayerNormW) -> Result<Array3<f32>> {
     let (b, t, c) = x.dim();
+    // The reshape is a view: the rows are already contiguous, and materialising
+    // it was a full copy of the tensor per norm call.
     let flat = x
         .view()
         .into_shape_with_order((b * t, c))
-        .expect("contiguous view")
-        .to_owned();
+        .expect("contiguous view");
     let out = layer_norm_rows(&flat, &norm.weight, &norm.bias)?;
     Ok(out.into_shape_with_order((b, t, c)).expect("reshape back"))
 }

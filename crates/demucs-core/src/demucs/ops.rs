@@ -563,7 +563,11 @@ pub fn group_norm<D: ndarray::Dimension>(
 }
 
 /// `nn.LayerNorm(dim, eps=1e-5)` over the last axis of a `(rows, dim)` tensor.
-pub fn layer_norm_rows(x: &Array2<f32>, weight: &[f32], bias: &[f32]) -> Result<Array2<f32>> {
+pub fn layer_norm_rows<S: ndarray::Data<Elem = f32> + Sync>(
+    x: &ndarray::ArrayBase<S, ndarray::Ix2>,
+    weight: &[f32],
+    bias: &[f32],
+) -> Result<Array2<f32>> {
     let (rows, dim) = x.dim();
     if weight.len() != dim || bias.len() != dim {
         return Err(Error::Shape(format!(
@@ -727,7 +731,14 @@ pub fn add_nd<
     a: &ndarray::ArrayBase<S1, D>,
     b: &ndarray::ArrayBase<S2, D>,
 ) -> ndarray::Array<f32, D> {
-    let mut out = ndarray::Array::<f32, D>::zeros(a.raw_dim());
+    // `a + b` writes every element, so the output does not need zeroing first.
+    let dim = a.raw_dim();
+    let mut out = if zero_outputs() {
+        ndarray::Array::<f32, D>::zeros(dim)
+    } else {
+        let buffer = uninit_vec(dim.size());
+        unsafe { ndarray::Array::from_shape_vec_unchecked(dim, buffer) }
+    };
     ndarray::Zip::from(&mut out)
         .and(a)
         .and(b)
