@@ -65,17 +65,17 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
     if kh == 1 && kw == 1 && sh == 1 && sw == 1 && ph == 0 && pw == 0 {
         debug_assert_eq!(out_h, h);
         debug_assert_eq!(out_w, width);
-        let mut flat = vec![0.0f32; b * oc * plane];
+        let mut flat = uninit_vec(b * oc * plane);
         // One GEMM per leading index, the leading indices in parallel.
         //
-        // This loop *is* the DConv's 1x1 cost: `dconv.conv2` is 4096 of these a
-        // segment (32 scopes of 128) and `dec.rewrite.conv` another 512, each of
-        // them a `(96, 6) @ (6, 336)` — 387 kFLOP, 0.07 ms, 5 GFLOP/s, against a
-        // memory floor two orders of magnitude below that. Serial, the crate's
-        // per-call setup is what the time goes on; the rows have nothing to do
-        // with each other, so they may as well all be in flight at once. Nested
-        // inside rayon the crate's own dispatch does not oversubscribe — it is
-        // the same pool — it just stops being the only thing running.
+        // The GEMM writes straight into the output's own buffer and the bias
+        // follows in a serial pass over the row it just wrote: an intermediate
+        // matrix per row costs an allocation plus a full copy of the row, and
+        // zeroing the output first costs a third pass that every element of the
+        // GEMM then overwrites. The row loop *is* the DConv's 1x1 cost — 512
+        // rows per `dconv.conv2` call of a `(96, 6) @ (6, 336)` each — so the
+        // per-row bookkeeping was most of the stage: 109.5 -> 43.6 ms, and the
+        // segment 1285.9 -> 1204.5 ms against the previous form.
         flat.par_chunks_mut(oc * plane)
             .enumerate()
             .for_each(|(bi, dst)| {
@@ -86,12 +86,16 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
                 let patch_view =
                     ArrayView2::from_shape((in_channels, plane), input_2d.as_slice().unwrap())
                         .expect("exact size");
-                // (oc, k) @ (k, plane) + bias in one GEMM. Splitting the output
-                // into channel blocks was measured *slower* (165 -> 218 ms across
-                // the segment): each block pays the crate's own parallel dispatch,
-                // and twelve small GEMMs lose to one big one here.
-                let product = matmul_with_row_bias(&weight, &patch_view, &w.bias);
-                dst.copy_from_slice(product.as_slice().expect("standard layout"));
+                // (oc, k) @ (k, plane), then the per-channel bias over the same
+                // row: a second sweep would read and write it again.
+                gemm_into_slice(dst, &weight, &patch_view);
+                for (row, shift) in dst.chunks_mut(plane).zip(w.bias.iter()) {
+                    if *shift != 0.0 {
+                        for value in row.iter_mut() {
+                            *value += *shift;
+                        }
+                    }
+                }
             });
         return Array4::from_shape_vec((b, oc, out_h, out_w), flat)
             .expect("the output shape matches");
@@ -752,6 +756,59 @@ pub fn uninit_matrix(m: usize, n: usize) -> Array2<f32> {
         buffer.set_len(m * n);
         Array2::from_shape_vec_unchecked((m, n), buffer)
     }
+}
+
+/// `(m, k) x (k, n)` written into a buffer the caller already owns.
+///
+/// Same call as [`gemm_strided`], with the output as a plain slice so a
+/// convolution can write into its own result instead of receiving a fresh
+/// matrix per row.
+pub fn gemm_into_slice(
+    dst: &mut [f32],
+    a: &ndarray::ArrayView2<f32>,
+    b: &ndarray::ArrayView2<f32>,
+) {
+    let (m, k) = a.dim();
+    debug_assert_eq!(k, b.dim().0);
+    let n = b.dim().1;
+    debug_assert_eq!(dst.len(), m * n);
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            dst.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            a.as_ptr(),
+            a.strides()[1],
+            a.strides()[0],
+            b.as_ptr(),
+            b.strides()[1],
+            b.strides()[0],
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+}
+
+/// A `Vec` of `len` elements that are not initialised yet.
+///
+/// SAFETY: the caller must write every element before reading any. The 1x1
+/// convolution's output is filled by the GEMM and the bias pass, so the zeroed
+/// version was paying for a full write of the same bytes.
+fn uninit_vec(len: usize) -> Vec<f32> {
+    if std::env::var("DEMUCS_UNINIT").is_ok_and(|v| v == "0") {
+        return vec![0.0f32; len];
+    }
+    let mut buffer = Vec::<f32>::with_capacity(len);
+    unsafe { buffer.set_len(len) };
+    buffer
 }
 
 /// Which GEMM implementation to use. `ndarray` is kept so the switch can be
