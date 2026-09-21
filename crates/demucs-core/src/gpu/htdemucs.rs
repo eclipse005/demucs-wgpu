@@ -1121,66 +1121,84 @@ fn dconv_stage(
                 eps: NORM_EPS,
             },
         )?;
-        // The GLU and the LayerScale that follows it are adjacent elementwise
-        // passes over the same activation, so they ride one dispatch — unless a
-        // trace wants the GLU's own output, which the layer-by-layer check
-        // compares against the host's.
+        // The GLU, the LayerScale that follows it and the layer's residual are
+        // three adjacent elementwise passes over the same tensor, so they ride
+        // one dispatch — unless a trace wants one of the intermediates, which
+        // the layer-by-layer check compares against the host's.
         let want_glu = trace.wants(&format!("{name}.glu"));
-        let gated = if want_glu || !shaders::fuse_glu_scale() {
-            let gated =
-                kernels.glu(gpu, arena, &mut recorder, &normed2, rows, layer.channels * time)?;
-            if want_glu {
-                record_tensor(gpu, &mut recorder, &gated, &format!("{name}.glu"), trace)?;
-            }
-            kernels.channel_affine_act_in_place(
+        let want_scaled =
+            trace.wants(&format!("{name}.out")) || trace.wants(&format!("{name}.scaled"));
+        let next = arena.tensor(gpu, &[rows, layer.channels, time], &format!("{name}.add"))?;
+        if trace.wants(&format!("{name}.residual")) {
+            // The residual accumulates across depths (the reference's
+            // `out = out + y`), so the base is `current`, not the branch input.
+            record_tensor(gpu, &mut recorder, &current, &format!("{name}.residual"), trace)?;
+        }
+        if !want_glu && !want_scaled && shaders::residual_fuse() && shaders::fuse_glu_scale() {
+            kernels.glu_channel_affine_add_into(
                 gpu,
                 arena,
-                recorder,
-                &gated,
-                &layer.gamma,
-                &layer.gamma_zero,
-                rows,
-                layer.channels,
-                time,
-                Activation::Identity,
-            )?;
-            gated
-        } else {
-            let gated = arena.tensor(
-                gpu,
-                &[rows, layer.channels, time],
-                &format!("{name}.glu"),
-            )?;
-            kernels.glu_channel_affine_into(
-                gpu,
-                arena,
-                recorder,
+                &mut recorder,
+                &current,
                 &normed2,
                 &layer.gamma,
                 &layer.gamma_zero,
-                &gated,
+                &next,
                 rows,
                 layer.channels * time,
                 layer.channels,
                 time,
             )?;
-            gated
-        };
-        if trace.wants(&format!("{name}.out")) {
-            record_tensor(gpu, &mut recorder, &gated, &format!("{name}.out"), trace)?;
+        } else {
+            let gated = if want_glu || !shaders::fuse_glu_scale() {
+                let gated =
+                    kernels.glu(gpu, arena, &mut recorder, &normed2, rows, layer.channels * time)?;
+                if want_glu {
+                    record_tensor(gpu, &mut recorder, &gated, &format!("{name}.glu"), trace)?;
+                }
+                kernels.channel_affine_act_in_place(
+                    gpu,
+                    arena,
+                    recorder,
+                    &gated,
+                    &layer.gamma,
+                    &layer.gamma_zero,
+                    rows,
+                    layer.channels,
+                    time,
+                    Activation::Identity,
+                )?;
+                gated
+            } else {
+                let gated = arena.tensor(
+                    gpu,
+                    &[rows, layer.channels, time],
+                    &format!("{name}.glu"),
+                )?;
+                kernels.glu_channel_affine_into(
+                    gpu,
+                    arena,
+                    recorder,
+                    &normed2,
+                    &layer.gamma,
+                    &layer.gamma_zero,
+                    &gated,
+                    rows,
+                    layer.channels * time,
+                    layer.channels,
+                    time,
+                )?;
+                gated
+            };
+            if trace.wants(&format!("{name}.out")) {
+                record_tensor(gpu, &mut recorder, &gated, &format!("{name}.out"), trace)?;
+            }
+            if want_scaled {
+                record_tensor(gpu, &mut recorder, &gated, &format!("{name}.scaled"), trace)?;
+            }
+            kernels.copy(gpu, arena, &mut recorder, &current, &next, current.len())?;
+            kernels.add_in_place(gpu, arena, &mut recorder, &next, &gated)?;
         }
-
-        if trace.wants(&format!("{name}.scaled")) {
-            record_tensor(gpu, &mut recorder, &gated, &format!("{name}.scaled"), trace)?;
-        }
-        let next = arena.tensor(gpu, &[rows, layer.channels, time], &format!("{name}.add"))?;
-        // The residual accumulates across depths (the reference's
-        // `out = out + y`), so the base is `current`, not the branch input.
-        kernels.copy(gpu, arena, &mut recorder, &current, &next, current.len())?;
-        if trace.wants(&format!("{name}.residual")) {
-            record_tensor(gpu, &mut recorder, &next, &format!("{name}.residual"), trace)?;
-        }
-        kernels.add_in_place(gpu, arena, &mut recorder, &next, &gated)?;
         if trace.wants(&format!("{name}.added")) {
             record_tensor(gpu, &mut recorder, &next, &format!("{name}.added"), trace)?;
         }
@@ -2098,14 +2116,23 @@ impl GpuHtdemucsRunner {
             record_tensor(gpu, &mut recorder, &attended_p, &format!("{name}.attn"), trace)?;
         }
 
-        // The affine is in place on `attended_p`, which then holds gamma1*attn.
-        kernels.channel_affine_act_in_place(
-            gpu, arena, &mut recorder, &attended_p, &layer.gamma1, &self.weights.transformer.zeros,
-            tokens, dim, 1, Activation::Identity,
-        )?;
+        // `res1 = x + gamma1 * attn`, in one pass over the tensor where the
+        // reference scales `attended_p` in place, copies the block input and
+        // adds. Same rounding: the scale's shift is the zero tensor.
         let mut res1 = arena.tensor(gpu, &[tokens, dim], &format!("{name}.res1"))?;
-        kernels.copy(gpu, arena, &mut recorder, x, &res1, x.len())?;
-        kernels.add_in_place(gpu, arena, &mut recorder, &res1, &attended_p)?;
+        if shaders::residual_fuse() {
+            kernels.channel_affine_act_add_into(
+                gpu, arena, &mut recorder, x, &attended_p, &layer.gamma1,
+                &self.weights.transformer.zeros, &mut res1, tokens, dim, 1, Activation::Identity,
+            )?;
+        } else {
+            kernels.channel_affine_act_in_place(
+                gpu, arena, &mut recorder, &attended_p, &layer.gamma1,
+                &self.weights.transformer.zeros, tokens, dim, 1, Activation::Identity,
+            )?;
+            kernels.copy(gpu, arena, &mut recorder, x, &res1, x.len())?;
+            kernels.add_in_place(gpu, arena, &mut recorder, &res1, &attended_p)?;
+        }
         if trace.wants(&format!("{name}.res1")) {
             record_tensor(gpu, &mut recorder, &res1, &format!("{name}.res1"), trace)?;
         }
@@ -2127,14 +2154,21 @@ impl GpuHtdemucsRunner {
             record_tensor(gpu, &mut recorder, &fed, &format!("{name}.fed"), trace)?;
         }
 
-        // In place on `fed`, which then holds gamma2*ffn.
-        kernels.channel_affine_act_in_place(
-            gpu, arena, &mut recorder, &fed, &layer.gamma2, &self.weights.transformer.zeros,
-            tokens, dim, 1, Activation::Identity,
-        )?;
+        // `res2 = res1 + gamma2 * ffn`, in one pass (see `.res1` above).
         let mut res2 = arena.tensor(gpu, &[tokens, dim], &format!("{name}.res2"))?;
-        kernels.copy(gpu, arena, &mut recorder, &res1, &res2, res1.len())?;
-        kernels.add_in_place(gpu, arena, &mut recorder, &res2, &fed)?;
+        if shaders::residual_fuse() {
+            kernels.channel_affine_act_add_into(
+                gpu, arena, &mut recorder, &res1, &fed, &layer.gamma2,
+                &self.weights.transformer.zeros, &mut res2, tokens, dim, 1, Activation::Identity,
+            )?;
+        } else {
+            kernels.channel_affine_act_in_place(
+                gpu, arena, &mut recorder, &fed, &layer.gamma2,
+                &self.weights.transformer.zeros, tokens, dim, 1, Activation::Identity,
+            )?;
+            kernels.copy(gpu, arena, &mut recorder, &res1, &res2, res1.len())?;
+            kernels.add_in_place(gpu, arena, &mut recorder, &res2, &fed)?;
+        }
         let final_out = arena.tensor(gpu, &[tokens, dim], &format!("{name}.normout"))?;
         group_norm_positions_stage(kernels, gpu, arena, &mut recorder, &res2, &final_out, &layer.norm_out, tokens, batch)?;
 
@@ -2197,14 +2231,22 @@ impl GpuHtdemucsRunner {
         let attn_proj = arena.tensor(gpu, &[q_tokens, dim], &format!("{name}.attn"))?;
         proj_stage(kernels, gpu, arena, &mut recorder, &attn_out, &layer.out_proj, &attn_proj, q_tokens, ones)?;
 
-        // In place on `attn_proj`, which then holds gamma1*attn.
-        kernels.channel_affine_act_in_place(
-            gpu, arena, &mut recorder, &attn_proj, &layer.gamma1, &self.weights.transformer.zeros,
-            q_tokens, dim, 1, Activation::Identity,
-        )?;
+        // `res1 = q_in + gamma1 * attn`, in one pass (see the self-attention
+        // block above).
         let mut res1 = arena.tensor(gpu, &[q_tokens, dim], &format!("{name}.res1"))?;
-        kernels.copy(gpu, arena, &mut recorder, q_in, &res1, q_in.len())?;
-        kernels.add_in_place(gpu, arena, &mut recorder, &res1, &attn_proj)?;
+        if shaders::residual_fuse() {
+            kernels.channel_affine_act_add_into(
+                gpu, arena, &mut recorder, q_in, &attn_proj, &layer.gamma1,
+                &self.weights.transformer.zeros, &mut res1, q_tokens, dim, 1, Activation::Identity,
+            )?;
+        } else {
+            kernels.channel_affine_act_in_place(
+                gpu, arena, &mut recorder, &attn_proj, &layer.gamma1,
+                &self.weights.transformer.zeros, q_tokens, dim, 1, Activation::Identity,
+            )?;
+            kernels.copy(gpu, arena, &mut recorder, q_in, &res1, q_in.len())?;
+            kernels.add_in_place(gpu, arena, &mut recorder, &res1, &attn_proj)?;
+        }
 
         let norm3 = layer.norm3.as_ref().ok_or_else(|| Error::Gpu("cross layer without norm3".into()))?;
         let normed3 = arena.tensor(gpu, &[q_tokens, dim], &format!("{name}.norm3"))?;
@@ -2215,14 +2257,22 @@ impl GpuHtdemucsRunner {
         let fed = arena.tensor(gpu, &[q_tokens, dim], &format!("{name}.fed"))?;
         proj_stage(kernels, gpu, arena, &mut recorder, &hidden, &layer.linear2, &fed, q_tokens, ones)?;
 
-        // In place on `fed`, which then holds gamma2*ffn.
-        kernels.channel_affine_act_in_place(
-            gpu, arena, &mut recorder, &fed, &layer.gamma2, &self.weights.transformer.zeros,
-            q_tokens, dim, 1, Activation::Identity,
-        )?;
+        // `res2 = res1 + gamma2 * ffn`, in one pass (see the self-attention
+        // block above).
         let mut res2 = arena.tensor(gpu, &[q_tokens, dim], &format!("{name}.res2"))?;
-        kernels.copy(gpu, arena, &mut recorder, &res1, &res2, res1.len())?;
-        kernels.add_in_place(gpu, arena, &mut recorder, &res2, &fed)?;
+        if shaders::residual_fuse() {
+            kernels.channel_affine_act_add_into(
+                gpu, arena, &mut recorder, &res1, &fed, &layer.gamma2,
+                &self.weights.transformer.zeros, &mut res2, q_tokens, dim, 1, Activation::Identity,
+            )?;
+        } else {
+            kernels.channel_affine_act_in_place(
+                gpu, arena, &mut recorder, &fed, &layer.gamma2,
+                &self.weights.transformer.zeros, q_tokens, dim, 1, Activation::Identity,
+            )?;
+            kernels.copy(gpu, arena, &mut recorder, &res1, &res2, res1.len())?;
+            kernels.add_in_place(gpu, arena, &mut recorder, &res2, &fed)?;
+        }
         let final_out = arena.tensor(gpu, &[q_tokens, dim], &format!("{name}.normout"))?;
         group_norm_positions_stage(kernels, gpu, arena, &mut recorder, &res2, &final_out, &layer.norm_out, q_tokens, batch)?;
 

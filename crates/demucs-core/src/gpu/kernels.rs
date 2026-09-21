@@ -370,6 +370,8 @@ pub struct Kernels {
     glu: wgpu::ComputePipeline,
     /// The DConv's GLU and its per-channel LayerScale in one pass.
     glu_channel_affine: wgpu::ComputePipeline,
+    /// The same with the DConv's residual folded in: `out = base + glu * gamma`.
+    glu_channel_affine_add: wgpu::ComputePipeline,
     sigmoid_gate: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     add_in_place: wgpu::ComputePipeline,
@@ -389,6 +391,9 @@ pub struct Kernels {
     crop_rows: wgpu::ComputePipeline,
     add_row_bias_in_place: wgpu::ComputePipeline,
     channel_affine_act_in_place: wgpu::ComputePipeline,
+    /// `out = base + act(y * scale + shift)`: the residual a transformer block
+    /// ends with, in one pass instead of a scale, a copy and an add.
+    channel_affine_act_add: wgpu::ComputePipeline,
     col2im: wgpu::ComputePipeline,
     group_norm: wgpu::ComputePipeline,
     /// The split form of `group_norm`, for slices too big for one workgroup:
@@ -562,6 +567,11 @@ impl Kernels {
                 &shaders::glu_channel_affine(),
                 "glu_channel_affine",
             )?,
+            glu_channel_affine_add: gpu.pipeline(
+                "glu_channel_affine_add",
+                &shaders::glu_channel_affine_add(),
+                "glu_channel_affine_add",
+            )?,
             sigmoid_gate: gpu.pipeline(
                 "sigmoid_gate",
                 &shaders::sigmoid_gate(),
@@ -629,6 +639,11 @@ impl Kernels {
                 "channel_affine_act_in_place",
                 &shaders::channel_affine_act_in_place(),
                 "channel_affine_act_in_place",
+            )?,
+            channel_affine_act_add: gpu.pipeline(
+                "channel_affine_act_add",
+                &shaders::channel_affine_act_add(),
+                "channel_affine_act_add",
             )?,
             col2im: gpu.pipeline("col2im", &shaders::col2im(), "col2im")?,
             tanh: gpu.pipeline("tanh_activation", &shaders::tanh(), "tanh_activation")?,
@@ -750,30 +765,44 @@ impl Kernels {
         // constant: the bindings stay live (an auto layout drops what the
         // shader stops using, and the bind group would then be invalid) and the
         // loads still issue, but every one of them hits the same cache line.
-        let strip_loads = |source: &str| -> String {
+        let strip = |source: &str, patterns: [&str; 2], reads_only: bool| -> String {
             let mut out = String::with_capacity(source.len());
             for line in source.split_inclusive('\n') {
                 let mut rest = line;
                 loop {
-                    let hit = ["A[", "B["]
+                    let hit = patterns
                         .iter()
-                        .filter_map(|pat| rest.find(pat))
-                        .min();
-                    let Some(start) = hit else { break };
+                        .filter_map(|pat| rest.find(pat).map(|at| (at, *pat)))
+                        .min_by_key(|(at, _)| *at);
+                    let Some((start, pat)) = hit else { break };
                     let Some(len) = rest[start..].find(']') else {
                         break;
                     };
+                    let after = &rest[start + len + 1..];
+                    // A shared slice can be the target of a store as well as a
+                    // load; only the loads are the traffic this mutant removes.
+                    let store = reads_only && after.trim_start().starts_with('=');
                     out.push_str(&rest[..start]);
-                    out.push_str(&rest[start..start + 2]);
-                    out.push_str("0u]");
-                    rest = &rest[start + len + 1..];
+                    if store {
+                        out.push_str(&rest[start..start + len + 1]);
+                    } else {
+                        out.push_str(pat);
+                        out.push_str("0u]");
+                    }
+                    rest = after;
                 }
                 out.push_str(rest);
             }
             out
         };
-        let no_global = strip_loads(&base);
+        let no_global = strip(&base, ["A[", "B["], false);
         let no_barrier = base.replace("    workgroupBarrier();\n", "");
+        // Shared-read mutant: every `As[...]`/`Bs[...]` load becomes the same
+        // element of its row, so it still issues but its address stops moving —
+        // and a load whose address is loop-invariant is free to float out of the
+        // loop entirely, which is the point: it isolates the register-side read
+        // traffic out of shared. A vec4 fragment is what would halve that count.
+        let no_shared = strip(&base, ["As[", "Bs["], true);
         let loads = base.matches("A[").count() + base.matches("B[").count();
         let barriers = base.matches("workgroupBarrier();").count();
         println!(
@@ -789,6 +818,10 @@ impl Kernels {
             (
                 "no_barrier",
                 gpu.pipeline("probe_no_barrier", &no_barrier, "gemm")?,
+            ),
+            (
+                "no_shared",
+                gpu.pipeline("probe_no_shared", &no_shared, "gemm")?,
             ),
         ];
 
@@ -907,6 +940,132 @@ impl Kernels {
             per_submit * 1e3,
             flops / per_submit / 1e12
         );
+        Ok(())
+    }
+
+    /// Times the `nn.Linear` GEMM (`A @ B^T + bias`, the `TransB` + `Bias` form)
+    /// over the tiles the tree knows how to compile.
+    ///
+    /// The plateau probe puts the kernel's ceiling at 3.3 TFLOP/s against 5.8 for
+    /// a register-only FMA probe, and rules out memory and barriers as the cause:
+    /// it is latency-bound, so occupancy is the lever, and occupancy is set by
+    /// the register tile — 128x128 with 16x16 threads gives every thread an 8x8
+    /// accumulator, 64 registers that alone cap the workgroups per SM.
+    ///
+    /// The conv experiment that rejected the narrow tile used a shape whose grid
+    /// did not fill the device (84 workgroups), which is a different question;
+    /// these run the Linear shapes, where every tile gets a full grid.
+    ///
+    /// Probe, not a path: driven by
+    /// `cargo test --release -p demucs-core --test gpu_gemm_plateau -- --ignored --nocapture`.
+    pub fn tile_probe(
+        &self,
+        gpu: &Gpu,
+        repeats: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        use shaders::{GemmEpilogue, Tile};
+        let variants = [
+            ("128x128 vec2", Tile::square(), false),
+            ("128x128 vec4", Tile::square(), true),
+            ("64x128 vec4", Tile::bm64_bn128(), true),
+            ("96x128 vec4", Tile::bm96_bn128(), true),
+            ("64x64 vec4", Tile::bm64_bn64(), true),
+        ];
+
+        let lda = pad_ceil(k, shaders::BK);
+        let ldb = pad_ceil(k, shaders::BN);
+        let job = GemmJob {
+            m,
+            n,
+            k,
+            lda,
+            ldb,
+            ldc: n,
+            batches: 1,
+            inner_count: 1,
+            a_outer: 0,
+            a_inner: 0,
+            b_outer: 0,
+            b_inner: 0,
+            c_outer: 0,
+            c_inner: 0,
+            transb: true,
+        };
+        let dims = GemmDims {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            lda: lda as u32,
+            ldb: ldb as u32,
+            ldc: n as u32,
+            inner_count: 1,
+            asa_outer: 0,
+            asa_inner: 0,
+            bsb_outer: 0,
+            bsb_inner: 0,
+            csc_outer: 0,
+            csc_inner: 0,
+            _pad: 0,
+        };
+        let mut arena = Arena::new(gpu, 1 << 30);
+        // Padded to the *widest* tile each operand is read with, so one set of
+        // buffers serves every variant below.
+        let a = arena.tensor(gpu, &[pad_ceil(m, shaders::BM) * lda], "tile.a")?;
+        let b = arena.tensor(gpu, &[pad_ceil(n, shaders::BN) * ldb], "tile.b")?;
+        let c = arena.tensor(gpu, &[m * n], "tile.c")?;
+        let bias = arena.tensor(gpu, &[n], "tile.bias")?;
+        let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
+        println!("tile probe {m}x{n}x{k} (transb + bias):");
+
+        for (label, tile, wide) in variants {
+            let pipeline = gpu.pipeline(
+                "tile_probe",
+                &shaders::gemm_variant(tile, true, GemmEpilogue::Bias, wide),
+                "gemm",
+            )?;
+            let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
+            let group = bind_group(
+                gpu,
+                "tile_probe",
+                &pipeline.get_bind_group_layout(0),
+                &[
+                    (&a.buffer, a.offset, (a.len() * 4) as u64),
+                    (&b.buffer, b.offset, (b.len() * 4) as u64),
+                    (&c.buffer, c.offset, (c.len() * 4) as u64),
+                    (&params.buffer, params.offset, 64),
+                    (&bias.buffer, bias.offset, (bias.len() * 4) as u64),
+                ],
+            );
+            // The grid follows the tile: the shader derives `m0`/`n0` from it.
+            let grid = job.grid_with(tile.bm, tile.bn);
+            let mut warm = Recorder::new(gpu);
+            warm.dispatch(label, &pipeline, &group, grid);
+            warm.submit(gpu)?;
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| Error::Gpu(format!("tile probe warm-up poll: {e}")))?;
+
+            let started = std::time::Instant::now();
+            let mut recorder = Recorder::new(gpu);
+            for _ in 0..repeats {
+                recorder.dispatch(label, &pipeline, &group, grid);
+            }
+            recorder.submit(gpu)?;
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| Error::Gpu(format!("tile probe poll: {e}")))?;
+            let elapsed = started.elapsed().as_secs_f64();
+            println!(
+                "  {label:>16}: {:.3} ms/dispatch, {:.2} TFLOP/s  (grid {}x{})",
+                elapsed / repeats as f64 * 1e3,
+                flops * repeats as f64 / elapsed / 1e12,
+                grid.0,
+                grid.1
+            );
+        }
         Ok(())
     }
 
@@ -1707,6 +1866,58 @@ impl Kernels {
         );
         let (gx, gy) = row_grid(count.div_ceil(ROW_THREADS));
         recorder.dispatch("glu_channel_affine", &self.glu_channel_affine, &group, (gx, gy, 1));
+        Ok(())
+    }
+
+    /// [`Kernels::glu_channel_affine_into`] with the DConv layer's residual in
+    /// the same pass: `out = base + (glu(x) * scale + shift)`.
+    ///
+    /// The reference's `out = current + gamma * glu(x)` is a GLU, a LayerScale
+    /// and an add over the same tensor; this is one pass over it. The
+    /// parenthesised order is the three-pass one's, so the sums round the same
+    /// way rather than merely to within an epsilon.
+    #[allow(clippy::too_many_arguments)]
+    pub fn glu_channel_affine_add_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        base: &DevTensor,
+        x: &DevTensor,
+        scale: &DevTensor,
+        shift: &DevTensor,
+        out: &DevTensor,
+        rows: usize,
+        half: usize,
+        channels: usize,
+        plane: usize,
+    ) -> Result<()> {
+        let count = rows * half;
+        let params = self.params(
+            gpu,
+            arena,
+            [rows as u32, half as u32, channels as u32, plane as u32],
+        )?;
+        let group = bind_group(
+            gpu,
+            "glu_channel_affine_add",
+            &self.glu_channel_affine_add.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (x.len() * 4) as u64),
+                (&out.buffer, out.offset, (count * 4) as u64),
+                (&scale.buffer, scale.offset, (scale.len() * 4) as u64),
+                (&shift.buffer, shift.offset, (shift.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+                (&base.buffer, base.offset, (base.len() * 4) as u64),
+            ],
+        );
+        let (gx, gy) = row_grid(count.div_ceil(ROW_THREADS));
+        recorder.dispatch(
+            "glu_channel_affine_add",
+            &self.glu_channel_affine_add,
+            &group,
+            (gx, gy, 1),
+        );
         Ok(())
     }
 
@@ -2672,6 +2883,83 @@ impl Kernels {
         recorder.dispatch(
             "channel_affine_act_in_place",
             &self.channel_affine_act_in_place,
+            &group,
+            (gx, gy, 1),
+        );
+        Ok(())
+    }
+
+    /// `out = base + act(x * scale + shift)`, over a `(batch, channels, plane)`
+    /// tensor whose channel index is `(i / plane) % channels`.
+    ///
+    /// This is the residual a transformer block ends with. Written as the
+    /// reference has it — `x = act(x * gamma)` in place, copy the block input,
+    /// add — it is three passes over the same tensor; as one pass it is the same
+    /// arithmetic with the same rounding (`fl(base + fl(x * gamma + shift))`,
+    /// and `shift` is the zero tensor the LayerScale came with), so the only
+    /// difference is the traffic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn channel_affine_act_add_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        base: &DevTensor,
+        x: &DevTensor,
+        scale: &DevTensor,
+        shift: &DevTensor,
+        out: &mut DevTensor,
+        batch: usize,
+        channels: usize,
+        plane: usize,
+        activation: Activation,
+    ) -> Result<()> {
+        if scale.len() < channels || shift.len() < channels {
+            return Err(Error::Shape(format!(
+                "an affine of {channels} channels was given {} scales and {} shifts",
+                scale.len(),
+                shift.len()
+            )));
+        }
+        if plane == 0 {
+            return Err(Error::Shape("affine needs a non-zero plane".into()));
+        }
+        let total = batch * channels * plane;
+        for (label, tensor) in [("x", x), ("base", base), ("out", out)] {
+            if tensor.len() < total {
+                return Err(Error::Shape(format!(
+                    "affine covers {total} elements, `{label}` holds {}",
+                    tensor.len()
+                )));
+            }
+        }
+        let params = self.params(
+            gpu,
+            arena,
+            [
+                channels as u32,
+                plane as u32,
+                activation.code(),
+                total as u32,
+            ],
+        )?;
+        let group = bind_group(
+            gpu,
+            "channel_affine_act_add",
+            &self.channel_affine_act_add.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (x.len() * 4) as u64),
+                (&scale.buffer, scale.offset, (scale.len() * 4) as u64),
+                (&shift.buffer, shift.offset, (shift.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+                (&base.buffer, base.offset, (base.len() * 4) as u64),
+                (&out.buffer, out.offset, (out.len() * 4) as u64),
+            ],
+        );
+        let (gx, gy) = row_grid(total.div_ceil(ROW_THREADS));
+        recorder.dispatch(
+            "channel_affine_act_add",
+            &self.channel_affine_act_add,
             &group,
             (gx, gy, 1),
         );

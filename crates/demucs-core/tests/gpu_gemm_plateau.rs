@@ -42,3 +42,21 @@ fn the_linear_gemm_plateau_is_split_between_its_parts() {
         kernels.plateau_probe(&gpu, 20, m, n, k).unwrap();
     }
 }
+
+/// The other half of the plateau: how much of it the register tile explains.
+///
+/// The FMA probe reaches 5.8 TFLOP/s while the GEMM sits at 3.3, and the
+/// mutants rule out global traffic and barriers; what is left is latency, and
+/// the tile sets how many warps are available to hide it.
+#[test]
+#[ignore = "a measurement, not a gate; run with --ignored --nocapture"]
+fn the_tile_sets_how_much_of_the_plateau_is_occupancy() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let kernels = Kernels::new(&gpu).unwrap();
+
+    for (m, n, k) in [(2688, 512, 512), (2688, 2048, 512), (2688, 512, 2048)] {
+        kernels.tile_probe(&gpu, 20, m, n, k).unwrap();
+    }
+}

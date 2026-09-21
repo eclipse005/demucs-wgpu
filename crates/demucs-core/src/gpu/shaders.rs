@@ -496,6 +496,15 @@ fn gemm_impl_with(tile: Tile, batched: bool, transb: bool, ep: GemmEpilogue) -> 
     gemm_impl_full(tile, batched, transb, ep, false, false, false)
 }
 
+/// One GEMM in an arbitrary (tile, transb, epilogue, slot width) form, for the
+/// probes.
+///
+/// The tree compiles a fixed set of these; the plateau work needs to time tiles
+/// that no path uses yet without wiring a pipeline for each into `Kernels`.
+pub fn gemm_variant(tile: Tile, transb: bool, ep: GemmEpilogue, wide: bool) -> String {
+    gemm_impl_width(tile, false, transb, ep, false, false, false, wide)
+}
+
 fn gemm_impl_full(
     tile: Tile,
     batched: bool,
@@ -505,6 +514,49 @@ fn gemm_impl_full(
     conv_direct: bool,
     a_row_exp: bool,
 ) -> String {
+    gemm_impl_width(tile, batched, transb, ep, coalesced_b, conv_direct, a_row_exp, false)
+}
+
+/// The same generator with the shared-memory slot width chosen: `wide` makes
+/// every staged slot four K elements (`vec4<f32>`) instead of two.
+///
+/// Why that matters, measured on the Linear shapes (`plateau_probe`'s mutants):
+/// replacing the *global* staging loads with cache hits buys 8-20%, removing the
+/// barriers 5-15%, and making the shared->register reads loop-invariant buys
+/// **45-60%** — so the shared reads, not the global traffic, are what the kernel
+/// spends its time and issue slots on. `vec2` fragments cost one LDS per 8 FMAs;
+/// reading `vec4` costs one per 16, which is the only way to move that number
+/// without shrinking the register tile (and the tile probe shows shrinking it
+/// under `vec2` loses 10%: the wider slot is what pays for a smaller tile).
+///
+/// The staging stores widen with it, so the staging instruction count halves
+/// too, and the row pitch keeps the same "coprime with 32" trick in the wider
+/// unit (`PW` of 9 `vec2` becomes 5 `vec4`).
+#[allow(clippy::too_many_arguments)]
+fn gemm_impl_width(
+    tile: Tile,
+    batched: bool,
+    transb: bool,
+    ep: GemmEpilogue,
+    coalesced_b: bool,
+    conv_direct: bool,
+    a_row_exp: bool,
+    wide: bool,
+) -> String {
+    // Elements per shared slot and the WGSL type that holds them.
+    let fw = if wide { 4 } else { 2 };
+    let fvt = if wide { "vec4<f32>" } else { "vec2<f32>" };
+    let zero = if wide {
+        "vec4<f32>(0.0, 0.0, 0.0, 0.0)"
+    } else {
+        "vec2<f32>(0.0, 0.0)"
+    };
+    // Row pitch in `f32`, and in slots. Both are kept even in their own unit so
+    // rows stay aligned for the slot type, and coprime with 32 slots' worth of
+    // banks so the 16 lanes reading a column get their own bank each.
+    let pad = if wide { BK + 4 } else { PAD };
+    let pw = pad / fw;
+    let row_slots = BK / fw;
     assert!(
         !(coalesced_b && transb),
         "the coalesced walk is written for the plain `(k, n)` operand only"
@@ -566,11 +618,39 @@ fn gemm_impl_full(
     // instruction buy more memory-level parallelism than 4 do. Do not "fix" this
     // again without measuring.
     let threads = tx * ty;
-    let slots_a = bm * (BK / 2) / threads;
+    let slots_a = bm * (BK / fw) / threads;
     // Sized to the B tile's own row count rather than A's: a 64-wide N tile needs
     // half the staging, and covering 128 rows of a 64-row tile was pure waste.
-    let slots_b = bn * (BK / 2) / threads;
+    let slots_b = bn * (BK / fw) / threads;
     assert!(slots_a > 0 && slots_b > 0, "a tile must stage at least one slot");
+
+    // One slot constructor from its element expressions, so the wide and narrow
+    // forms differ only in how many there are.
+    let ctor = |parts: &[String]| -> String {
+        format!("{fvt}(\n               {})", parts.join(",\n               "))
+    };
+    // The `k`-th component of a slot as a WGSL swizzle.
+    let comp = |slot: String, c: usize| -> String {
+        let swizzle = ["x", "y", "z", "w"][c];
+        format!("{slot}.{swizzle}")
+    };
+    // Each slot element carries its own K guard: the tail block reads past
+    // `gd.k` and must stage zeros there.
+    let guarded = |parts: &[String], base: &str| -> Vec<String> {
+        parts
+            .iter()
+            .enumerate()
+            .map(|(c, part)| {
+                // The first element's guard stays bare, so the two-wide source
+                // is textually what it always was.
+                if c == 0 {
+                    format!("select(0.0, {part}, {base} < gd.k)")
+                } else {
+                    format!("select(0.0, {part}, {base} + {c}u < gd.k)")
+                }
+            })
+            .collect()
+    };
 
     // Global-load double buffering: stage `kb + 1` is fetched into registers
     // while `kb` is being consumed from shared, so the ~600-cycle global latency
@@ -579,47 +659,51 @@ fn gemm_impl_full(
     let mut prefetch = String::new();
     let mut store_prefetch = String::new();
     for e in 0..slots_a {
-        prefetch_decl.push_str(&format!(
-            "    var pfa{e}: vec2<f32> = vec2<f32>(0.0, 0.0);\n"
-        ));
+        prefetch_decl.push_str(&format!("    var pfa{e}: {fvt} = {zero};\n"));
     }
     for e in 0..slots_b {
-        prefetch_decl.push_str(&format!(
-            "    var pfb{e}: vec2<f32> = vec2<f32>(0.0, 0.0);\n"
-        ));
+        prefetch_decl.push_str(&format!("    var pfb{e}: {fvt} = {zero};\n"));
     }
     for e in 0..slots_a {
         let flat = format!("(ty * {tx}u + tx + {e}u * {threads}u)");
+        // A is row-major in k, so a whole slot is a contiguous run: the wide form
+        // is one 16-byte global load per slot instead of two 8-byte ones.
+        let reads: Vec<String> = (0..fw)
+            .map(|c| {
+                format!(
+                    "A[@A@(m0 + ar{e}) * gd.lda + k1 + ac{e} * {fw}u + {c}u]"
+                )
+            })
+            .collect();
         prefetch.push_str(&format!(
             "            let ai{e} = {flat};\n\
              \x20           let ar{e} = ai{e} / {row}u;\n\
              \x20           let ac{e} = ai{e} % {row}u;\n\
-             \x20           pfa{e} = vec2<f32>(\n\
-             \x20               A[@A@(m0 + ar{e}) * gd.lda + k1 + ac{e} * 2u],\n\
-             \x20               A[@A@(m0 + ar{e}) * gd.lda + k1 + ac{e} * 2u + 1u]);\n",
-            row = ROW_SLOTS,
+             \x20           pfa{e} = {ctor};\n",
+            row = row_slots,
+            ctor = ctor(&reads),
         ));
         // Re-derived rather than carried over: the prefetch above lives inside
         // the same `if` block, but the store runs after the reduction's barrier,
-        // outside it.
-        let (lo, hi) = if a_row_exp {
-            (
-                format!("a_row_scale(pfa{e}.x, ast{e})"),
-                format!("a_row_scale(pfa{e}.y, ast{e})"),
-            )
-        } else {
-            (format!("pfa{e}.x"), format!("pfa{e}.y"))
-        };
+        // outside it. Each element keeps its own guard, so a K tail that runs
+        // past the block still stages zeros.
+        let parts: Vec<String> = (0..fw)
+            .map(|c| {
+                let value = comp(format!("pfa{e}"), c);
+                if a_row_exp {
+                    format!("a_row_scale({value}, ast{e})")
+                } else {
+                    value
+                }
+            })
+            .collect();
         store_prefetch.push_str(&format!(
             "        let si{e} = {flat};\n\
              \x20       let sr{e} = si{e} / {row}u;\n\
              \x20       let sc{e} = si{e} % {row}u;\n\
-             \x20       As[sr{e} * PW + sc{e}] = vec2<f32>(\n\
-             \x20           select(0.0, {lo}, k1 + sc{e} * 2u < gd.k),\n\
-             \x20           select(0.0, {hi}, k1 + sc{e} * 2u + 1u < gd.k));\n",
-            row = ROW_SLOTS,
-            lo = lo,
-            hi = hi,
+             \x20       As[sr{e} * PW + sc{e}] = {ctor};\n",
+            row = row_slots,
+            ctor = ctor(&guarded(&parts, &format!("k1 + sc{e} * {fw}u"))),
         ));
     }
     for e in 0..slots_b {
@@ -630,43 +714,40 @@ fn gemm_impl_full(
         // the global address differs. In the transposed form k is the *column*
         // index (stride 1), so the stage offset has to be added explicitly; in the
         // plain form k is the row index and `(k1 + ...) * ldb` already carries it.
-        let row = format!("bi{e} / {row}u", row = ROW_SLOTS);
-        let col = format!("bi{e} % {row}u", row = ROW_SLOTS);
-        let (lo, hi) = if conv_direct {
-            (
-                format!("conv_b(k1 + bx{e} * 2u, oy, ox0 + by{e}, {conv_base})"),
-                format!("conv_b(k1 + bx{e} * 2u + 1u, oy, ox0 + by{e}, {conv_base})"),
-            )
-        } else if transb {
-            (
-                format!("B[@B@(n0 + by{e}) * gd.ldb + k1 + bx{e} * 2u]"),
-                format!("B[@B@(n0 + by{e}) * gd.ldb + k1 + bx{e} * 2u + 1u]"),
-            )
-        } else {
-            (
-                format!("B[@B@(k1 + bx{e} * 2u) * gd.ldb + n0 + by{e}]"),
-                format!("B[@B@(k1 + bx{e} * 2u + 1u) * gd.ldb + n0 + by{e}]"),
-            )
-        };
+        let row = format!("bi{e} / {row}u", row = row_slots);
+        let col = format!("bi{e} % {row}u", row = row_slots);
+        // Only the transposed operand keeps consecutive k in consecutive
+        // addresses, so only there does a wide slot become one global load.
+        let reads: Vec<String> = (0..fw)
+            .map(|c| {
+                let k = format!("k1 + bx{e} * {fw}u + {c}u");
+                if conv_direct {
+                    format!("conv_b({k}, oy, ox0 + by{e}, {conv_base})")
+                } else if transb {
+                    format!("B[@B@(n0 + by{e}) * gd.ldb + {k}]")
+                } else {
+                    // The parentheses matter: `k` is a sum, and it is the whole
+                    // of it that strides by `ldb`.
+                    format!("B[@B@({k}) * gd.ldb + n0 + by{e}]")
+                }
+            })
+            .collect();
         prefetch.push_str(&format!(
             "            let bi{e} = {flat};\n\
              \x20           let by{e} = {row};\n\
              \x20           let bx{e} = {col};\n\
-             \x20           pfb{e} = vec2<f32>(\n\
-             \x20               {lo},\n\
-             \x20               {hi});\n",
-            lo = lo,
-            hi = hi,
+             \x20           pfb{e} = {ctor};\n",
+            ctor = ctor(&reads),
         ));
         // Re-derived for the same reason as A's: the store is outside the `if`.
+        let parts: Vec<String> = (0..fw).map(|c| comp(format!("pfb{e}"), c)).collect();
         store_prefetch.push_str(&format!(
             "        let ui{e} = {flat};\n\
              \x20       let ur{e} = ui{e} / {row}u;\n\
              \x20       let uc{e} = ui{e} % {row}u;\n\
-             \x20       Bs[ur{e} * PW + uc{e}] = vec2<f32>(\n\
-             \x20           select(0.0, pfb{e}.x, k1 + uc{e} * 2u < gd.k),\n\
-             \x20           select(0.0, pfb{e}.y, k1 + uc{e} * 2u + 1u < gd.k));\n",
-            row = ROW_SLOTS,
+             \x20       Bs[ur{e} * PW + uc{e}] = {ctor};\n",
+            row = row_slots,
+            ctor = ctor(&guarded(&parts, &format!("k1 + uc{e} * {fw}u"))),
         ));
     }
 
@@ -734,7 +815,7 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
             stats_prologue.push_str(&format!(
                 "    let asr{e} = (ty * {tx}u + tx + {e}u * {threads}u) / {row}u;\n\
                  \x20   let ast{e} = AStats[wid.z * ae.y + m0 + asr{e}];\n",
-                row = ROW_SLOTS,
+                row = row_slots,
             ));
         }
     }
@@ -743,24 +824,22 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
         let flat = format!("(ty * {tx}u + tx + {e}u * {threads}u)");
         // With the folded softmax the staged value is rewritten on the way in;
         // otherwise it goes to shared exactly as loaded.
-        let loaded = |col: &str| {
-            let addr = format!("A[@A@(m0 + wr{e}) * gd.lda + {col}]");
+        let loaded = |c: usize| {
+            let addr = format!("A[@A@(m0 + wr{e}) * gd.lda + wc{e} * {fw}u + {c}u]");
             if a_row_exp {
                 format!("a_row_scale({addr}, ast{e})")
             } else {
                 addr
             }
         };
+        let parts: Vec<String> = (0..fw).map(loaded).collect();
         store_stage0.push_str(&format!(
             "        let wi{e} = {flat};\n\
              \x20       let wr{e} = wi{e} / {row}u;\n\
              \x20       let wc{e} = wi{e} % {row}u;\n\
-             \x20       As[wr{e} * PW + wc{e}] = vec2<f32>(\n\
-             \x20           select(0.0, {lo}, wc{e} * 2u < gd.k),\n\
-             \x20           select(0.0, {hi}, wc{e} * 2u + 1u < gd.k));\n",
-            row = ROW_SLOTS,
-            lo = loaded(&format!("wc{e} * 2u")),
-            hi = loaded(&format!("wc{e} * 2u + 1u")),
+             \x20       As[wr{e} * PW + wc{e}] = {ctor};\n",
+            row = row_slots,
+            ctor = ctor(&guarded(&parts, &format!("wc{e} * {fw}u"))),
         ));
     }
     for e in 0..slots_b {
@@ -771,39 +850,36 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
             (format!("vi{e} % {bn}u"), format!("vi{e} / {bn}u"))
         } else {
             (
-                format!("vi{e} / {row}u", row = ROW_SLOTS),
-                format!("vi{e} % {row}u", row = ROW_SLOTS),
+                format!("vi{e} / {row}u", row = row_slots),
+                format!("vi{e} % {row}u", row = row_slots),
             )
         };
-        let (lo, hi) = if conv_direct {
-            (
-                format!("conv_b(vc{e} * 2u, oy, ox0 + vr{e}, {conv_base})"),
-                format!("conv_b(vc{e} * 2u + 1u, oy, ox0 + vr{e}, {conv_base})"),
-            )
-        } else if transb {
-            (
-                format!("B[@B@(n0 + vr{e}) * gd.ldb + vc{e} * 2u]"),
-                format!("B[@B@(n0 + vr{e}) * gd.ldb + vc{e} * 2u + 1u]"),
-            )
-        } else {
-            (
-                format!("B[@B@vc{e} * 2u * gd.ldb + n0 + vr{e}]"),
-                format!("B[@B@(vc{e} * 2u + 1u) * gd.ldb + n0 + vr{e}]"),
-            )
-        };
+        // Only the transposed operand keeps consecutive k in consecutive
+        // addresses, so only there does a wide slot become one global load.
+        let parts: Vec<String> = (0..fw)
+            .map(|c| {
+                let k = format!("vc{e} * {fw}u + {c}u");
+                if conv_direct {
+                    format!("conv_b({k}, oy, ox0 + vr{e}, {conv_base})")
+                } else if transb {
+                    format!("B[@B@(n0 + vr{e}) * gd.ldb + {k}]")
+                } else {
+                    format!("B[@B@({k}) * gd.ldb + n0 + vr{e}]")
+                }
+            })
+            .collect();
         store_stage0.push_str(&format!(
             "        let vi{e} = {flat};\n\
              \x20       let vr{e} = {row};\n\
              \x20       let vc{e} = {col};\n\
-             \x20       Bs[vr{e} * PW + vc{e}] = vec2<f32>(\n\
-             \x20           select(0.0, {lo}, vc{e} * 2u < gd.k),\n\
-             \x20           select(0.0, {hi}, vc{e} * 2u + 1u < gd.k));\n",
-            lo = lo,
-            hi = hi,
+             \x20       Bs[vr{e} * PW + vc{e}] = {ctor};\n",
+            ctor = ctor(&guarded(&parts, &format!("vc{e} * {fw}u"))),
         ));
     }
 
-    // Reduction in steps of two so every shared access is one 8-byte load.
+    // Reduction in steps of one shared slot: `fw` K elements per load, so a
+    // `vec2` slot is an 8-byte load per 2 FMAs and a `vec4` one a 16-byte load
+    // per 4.
     let mut compute = String::new();
     // The shared row bases do not move across the K loop, so they are computed
     // once and every access below is a constant offset from one. Leaving the
@@ -821,7 +897,7 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
             "        let br{j} = (tx + {j}u * TX) * PW;\n"
         ));
     }
-    for q2 in 0..BK / 2 {
+    for q2 in 0..BK / fw {
         compute.push_str("        {\n");
         for i in 0..tm {
             compute.push_str(&format!(
@@ -835,10 +911,14 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
         }
         for i in 0..tm {
             for j in 0..tn {
-                compute.push_str(&format!(
-                    "            c{i}_{j} = fma(a{i}.x, b{j}.x, c{i}_{j});\n\
-                     \x20           c{i}_{j} = fma(a{i}.y, b{j}.y, c{i}_{j});\n"
-                ));
+                // One FMA per element of the slot: `fw` shared loads feed
+                // `fw` times the FMAs, which is what the width buys.
+                for c in 0..fw {
+                    let sw = ["x", "y", "z", "w"][c];
+                    compute.push_str(&format!(
+                        "            c{i}_{j} = fma(a{i}.{sw}, b{j}.{sw}, c{i}_{j});\n"
+                    ));
+                }
             }
         }
         compute.push_str("        }\n");
@@ -919,8 +999,8 @@ const TN: u32 = {tn}u;
 const TX: u32 = {tx}u;
 const TY: u32 = {ty}u;
 
-var<workgroup> As: array<vec2<f32>, {as_len}>;
-var<workgroup> Bs: array<vec2<f32>, {bs_len}>;
+var<workgroup> As: array<{fvt}, {as_len}>;
+var<workgroup> Bs: array<{fvt}, {bs_len}>;
 
 {gelu_fn}
 @compute @workgroup_size({tx}, {ty})
@@ -966,16 +1046,17 @@ fn gemm(
         bm = bm,
         bn = bn,
         bk = BK,
-        pad = PAD,
-        pw = PW,
+        pad = pad,
+        pw = pw,
+        fvt = fvt,
         tm = tm,
         tn = tn,
         tx = tx,
         ty = ty,
-        as_len = bm * PW,
+        as_len = bm * pw,
         // Sized to the B tile's own rows: the staging walk now covers exactly the
         // rows the compute loop reads, so a 64-wide N tile halves this.
-        bs_len = bn * PW,
+        bs_len = bn * pw,
         conv_prologue = if conv_direct {
             "    // One output row per tile: only `BN <= out_w` takes this path.
                  let oy = n0 / cd.x;
@@ -1357,6 +1438,36 @@ fn glu(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid:
 /// separate affine applies — that one is pure elementwise, so folding it into
 /// the producer's store changes no rounding.
 pub fn glu_channel_affine() -> String {
+    glu_channel_affine_impl(false)
+}
+
+/// `out = base + (glu(x) * scale + shift)`, one pass.
+///
+/// The DConv layer ends with `out = current + gamma * glu(...)`, which as three
+/// passes (the GLU, the LayerScale and the residual `current + ...`) is three
+/// walks over the layer's output. The parentheses are load-bearing: scaling and
+/// shifting first, then adding, is the association the three-pass form has, and
+/// with a zero shift the two are the same arithmetic rather than merely close.
+pub fn glu_channel_affine_add() -> String {
+    glu_channel_affine_impl(true)
+}
+
+fn glu_channel_affine_impl(add: bool) -> String {
+    let base_decl = if add {
+        "@group(0) @binding(5) var<storage, read> Base: array<f32>;"
+    } else {
+        ""
+    };
+    let store = if add {
+        "    Out[i] = Base[i] + (value * Scale[channel] + Shift[channel]);"
+    } else {
+        "    Out[i] = value * Scale[channel] + Shift[channel];"
+    };
+    let entry = if add {
+        "glu_channel_affine_add"
+    } else {
+        "glu_channel_affine"
+    };
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> X: array<f32>;
@@ -1364,11 +1475,12 @@ pub fn glu_channel_affine() -> String {
 @group(0) @binding(2) var<storage, read> Scale: array<f32>;
 @group(0) @binding(3) var<storage, read> Shift: array<f32>;
 @group(0) @binding(4) var<uniform> gd: vec4<u32>;  // rows, half, channels, plane
+{base_decl}
 
 const GRID_X: u32 = 65535u;
 
 @compute @workgroup_size({threads})
-fn glu_channel_affine(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+fn {entry}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
     let i = (wid.y * GRID_X + wid.x) * {threads}u + lid.x;
     // `half` is the GLU's half, `channels * plane`; the LayerScale's channel
     // index is the one `channel_affine_act_in_place` uses, `(i / plane) % channels`.
@@ -1383,7 +1495,7 @@ fn glu_channel_affine(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invo
     let gate = X[base + half + col];
     let value = X[base + col] * (1.0 / (1.0 + exp(-gate)));
     let channel = (i / plane) % channels;
-    Out[i] = value * Scale[channel] + Shift[channel];
+{store}
 }}
 "#,
         threads = ROW_THREADS,
@@ -1746,12 +1858,55 @@ fn col2im(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
 /// it is used only where a checkpoint asks for GELU (the roformer's GELU has its
 /// own kernel).
 pub fn channel_affine_act_in_place() -> String {
+    channel_affine_act(false)
+}
+
+/// Whether a transformer block's `x + gamma * y` residual is one kernel or the
+/// reference's three (scale in place, copy the base, add). `DEMUCS_RESIDUAL_FUSE=0`
+/// takes the long way, which is also how the trace's intermediates stay visible.
+pub fn residual_fuse() -> bool {
+    std::env::var("DEMUCS_RESIDUAL_FUSE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// `Out[i] = Base[i] + act(X[i] * Scale[c] + Shift[c])`, one pass.
+///
+/// The residual pair every transformer block ends with — an in-place LayerScale,
+/// a copy of the block input and an add — is three passes over the same
+/// `(tokens, dim)` tensor; this is the one pass they mean. `Base` is usually the
+/// block input (`res = x + gamma * attn`).
+pub fn channel_affine_act_add() -> String {
+    channel_affine_act(true)
+}
+
+fn channel_affine_act(add: bool) -> String {
+    let (x_decl, extra_decl, store) = if add {
+        (
+            "@group(0) @binding(0) var<storage, read> X: array<f32>;",
+            "@group(0) @binding(4) var<storage, read> Base: array<f32>;\n\
+             @group(0) @binding(5) var<storage, read_write> Out: array<f32>;",
+            "    Out[i] = Base[i] + value;",
+        )
+    } else {
+        (
+            "@group(0) @binding(0) var<storage, read_write> X: array<f32>;",
+            "",
+            "    X[i] = value;",
+        )
+    };
+    let entry = if add {
+        "channel_affine_act_add"
+    } else {
+        "channel_affine_act_in_place"
+    };
     format!(
         r#"
-@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+{x_decl}
 @group(0) @binding(1) var<storage, read> Scale: array<f32>;
 @group(0) @binding(2) var<storage, read> Shift: array<f32>;
 @group(0) @binding(3) var<uniform> gd: vec4<u32>;  // channels, plane, activation, total
+{extra_decl}
 
 const GRID_X: u32 = 65535u;
 
@@ -1767,7 +1922,7 @@ fn erf_approx(z: f32) -> f32 {{
 }}
 
 @compute @workgroup_size({threads})
-fn channel_affine_act_in_place(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+fn {entry}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
     let i = (wid.y * GRID_X + wid.x) * {threads}u + lid.x;
     if (i >= gd.w) {{ return; }}
     let channel = (i / gd.y) % gd.x;
@@ -1780,7 +1935,7 @@ fn channel_affine_act_in_place(@builtin(workgroup_id) wid: vec3<u32>, @builtin(l
     }} else if (mode == 3u) {{
         value = value / (1.0 + exp(-value));
     }}
-    X[i] = value;
+{store}
 }}
 "#,
         threads = ROW_THREADS
