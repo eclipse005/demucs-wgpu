@@ -59,6 +59,12 @@ Two consequences:
   ~4× smaller. When you do load the bag, a `StemSelection::Some([...])` request runs only the
   networks that feed the requested stems.
 
+  Measured on the 20 s clip (`shifts=0`, Vulkan): the bag with `--stem vocals` runs 13.34x and takes
+  2.68 s to load, the shard alone 15.61x and 1.09 s, and the two write **identical** files (SHA-256
+  match, max abs difference 0). Against the Python/CUDA reference for the same shard (1.77 s,
+  11.29x) the shard is 1.38x faster at 125.34 dB SNR, and the whole 176.3 s track runs 18.36x
+  (9.60 s, 16.46x including the load).
+
 Grab the official weights from the [adefossez/HTDemucs](https://huggingface.co/adefossez/HTDemucs)
 Hugging Face snapshot (or any mirror of the `htdemucs` v4 checkpoints).
 
@@ -171,6 +177,31 @@ as the line to beat. The steady chunk has come down 299 ms -> 265 ms over the la
 attention's softmax now writes only the per-row `(max, 1/Σexp)` and the `P·V` product folds the
 exponential into its own `A` staging, so the `(heads·tokens, tokens)` probability matrix is never
 materialised, and the norm kernels no longer walk their tensors strided.
+
+## Acceptance baseline
+
+Every acceptance number from here on is measured on the **`htdemucs_ft` vocals specialist** — the
+one model an ASR consumer ships — and not on the base `htdemucs`. The reference side is
+`tools/ft_vocals_reference.py`, which runs the same weights (`bag.models[3]`, the `04573f0d` shard,
+here loaded standalone) through `apply_model` with the port's settings: `shifts=0` for determinism,
+`overlap=0.25`, `split=True`, the model's own 7.8 s segment. The port side is
+`demucs separate <input> -o out --model <snapshot>/04573f0d.safetensors --stem vocals --device vulkan
+--shifts 0`; the two are compared with `demucs compare`. The inputs are fixed on this machine:
+`bench/clip20.wav` (20 s) and `bench/mix176.wav` (176.309 s — the base model's four stems summed,
+because the original mix that earlier rounds used is no longer on disk).
+
+| Input | Reference (CUDA) | This port (Vulkan) | Gap | SNR vs reference |
+|-------|------------------|--------------------|-----|------------------|
+| `clip20.wav` | 2.22 s / 8.99x | 1.24 s / 16.07x | port 1.79x ahead | 125.34 dB |
+| `mix176.wav` | 8.17 s / **21.58x** | 9.19 s / **19.17x** | reference 1.13x | 127.17 dB |
+
+(A second run of the same binary measured 9.04 s / 19.51x on `mix176`; this machine drifts ±4%, so
+quote the pair, not the digit. The 20 s row carries the reference's own warm-up over 5 chunks; the
+176.3 s row is the one to compare.) On it the port's GPU submission alone is 268 ms per chunk
+against the reference's 264 ms *total*, so the remaining work is inside the kernels first and the
+~24 ms per chunk of host-side cost (input upload 8 ms, bind groups 2 ms, stem readback and
+overlap-add ~13 ms) second.
+
 
 ## Project layout
 

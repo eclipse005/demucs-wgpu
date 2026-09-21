@@ -1419,21 +1419,73 @@ impl GpuHtdemucsRunner {
 }
 
 impl GpuHtdemucsRunner {
+    /// The transformer's positional embeddings for these token counts, built on
+    /// the host and uploaded once per run.
+    ///
+    /// They are a pure function of `(freqs, frames, time_samples)` — the token
+    /// counts are fixed for a run — yet they used to be rebuilt and re-uploaded
+    /// (5.5 MB of 2-D table, 2.75 MB of 1-D, plus the host sin/cos sweep) for
+    /// *every* chunk. `upload_dedicated` keeps them off the pooling arena, so
+    /// they survive the per-chunk `Arena::reset`; the cached `DevTensor`s are
+    /// refcounted views, so handing one out costs an `Arc` clone.
+    fn pos_embeddings(
+        &self,
+        freqs: usize,
+        frames: usize,
+        time_samples: usize,
+    ) -> Result<(DevTensor, DevTensor)> {
+        let mut slot = self.pos_embeddings.borrow_mut();
+        if let Some(cached) = slot.as_ref() {
+            if cached.freq == (freqs, frames) && cached.time_samples == time_samples {
+                return Ok((cached.spec.clone(), cached.time.clone()));
+            }
+        }
+        let spec = two_dimensional_positions(
+            512,
+            freqs,
+            frames,
+            self.config.t_max_period as f32,
+        );
+        let time = one_dimensional_positions(time_samples, 512, self.config.t_max_period as f32);
+        let mut arena = self.work.borrow_mut();
+        let spec = arena.upload_dedicated(
+            &self.gpu,
+            spec.shape(),
+            spec.as_slice().expect("standard layout"),
+            "xt.pos.spec",
+        )?;
+        let time_dev = arena.upload_dedicated(
+            &self.gpu,
+            time.shape(),
+            time.as_slice().expect("standard layout"),
+            "xt.pos.time",
+        )?;
+        drop(arena);
+        *slot = Some(PosEmbeddings {
+            freq: (freqs, frames),
+            time_samples,
+            spec: spec.clone(),
+            time: time_dev.clone(),
+        });
+        Ok((spec, time_dev))
+    }
+
     /// The cross-transformer, from the two bottleneck tensors in their branch
     /// layouts to the same layouts after the channel downsampler's input.
     ///
     /// Token order is t-major (`token = t * freqs + freq`), matching the
-    /// reference's rearrange and the host traces. The pos embeddings are
-    /// computed on the host per chunk (they depend on the token counts) and
-    /// uploaded; everything else is device work.
+    /// reference's rearrange and the host traces. The pos embeddings arrive
+    /// already uploaded (they are a pure function of the token counts, so
+    /// [`GpuHtdtemucsRunner::pos_embeddings`] builds them once per run);
+    /// everything else is device work.
     #[allow(clippy::too_many_arguments)]
     fn forward_transformer(
         &self,
         arena: &mut Arena,
         freq_bottleneck: &DevTensor,
         time_bottleneck: &DevTensor,
-        pos_spec: &Array3<f32>,
-        pos_time: &Array3<f32>,
+        pos_spec: &DevTensor,
+        pos_time: &DevTensor,
         recorder: &mut Recorder,
         trace: &mut dyn TraceSink,
     ) -> Result<(DevTensor, DevTensor)> {
@@ -1465,26 +1517,21 @@ impl GpuHtdemucsRunner {
         let mut spec = spec_raw.with_shape(vec![batch * freq_tokens, dim])?;
         let mut spec_cur = arena.tensor(gpu, &[batch * freq_tokens, dim], "xt.spec.normin")?;
         layer_norm_stage(kernels, gpu, arena, &mut recorder, &spec, &spec_cur, &t.norm_in, batch * freq_tokens)?;
-        // The pos embeddings are the chunk's first host write *after* dispatches
-        // are pending on the recorder, so they get a fresh, never-pooled buffer:
-        // a pooled one may still be read by those dispatches, and a
-        // `write_buffer` lands ahead of the whole pending submission.
-        let pos_spec_dev = arena.upload_dedicated(
-            gpu, pos_spec.shape(), pos_spec.as_slice().expect("standard layout"), "xt.pos.spec",
-        )?;
+        // The pos embeddings are a pure function of the token counts, so they
+        // arrive already on the device (see `pos_embeddings`): the chunk only
+        // reads them. They live in dedicated buffers, so they are not pooled and
+        // not touched by the per-chunk `Arena::reset`.
+        //
         // The pos embedding is one segment's worth; add_in_place repeats it
         // along the leading (token) axis, so every batch segment gets its own
         // copy of the same positions.
-        kernels.add_in_place(gpu, arena, &mut recorder, &spec_cur, &pos_spec_dev)?;
+        kernels.add_in_place(gpu, arena, &mut recorder, &spec_cur, pos_spec)?;
         let mut time = arena.tensor(gpu, &[batch, time_tokens, dim], "xt.time.tokens")?;
         kernels.transpose(gpu, arena, &mut recorder, time_bottleneck, &time,
             batch, time_bottleneck.shape[1], time_tokens, 1)?;
         let mut time_cur = arena.tensor(gpu, &[batch * time_tokens, dim], "xt.time.normin")?;
         layer_norm_stage(kernels, gpu, arena, &mut recorder, &time, &time_cur, &t.norm_in_t, batch * time_tokens)?;
-        let pos_time_dev = arena.upload_dedicated(
-            gpu, pos_time.shape(), pos_time.as_slice().expect("standard layout"), "xt.pos.time",
-        )?;
-        kernels.add_in_place(gpu, arena, &mut recorder, &time_cur, &pos_time_dev)?;
+        kernels.add_in_place(gpu, arena, &mut recorder, &time_cur, pos_time)?;
         drop(spec);
         drop(time);
 
@@ -1613,16 +1660,9 @@ impl GpuHtdemucsRunner {
             )
         }; // arena borrow dropped
 
-        // Pos embeddings, computed on the host per chunk. The device's two-step
-        // transpose produces t-major tokens matching the reference's layout.
-        // One segment's worth is enough: the add broadcasts along the leading
-        // (token) axis, so every batch segment gets the same positions.
-        let pos_spec = two_dimensional_positions(
-            512, freq_dims[2], freq_dims[3], self.config.t_max_period as f32,
-        );
-        let pos_time = one_dimensional_positions(
-            time_samples, 512, self.config.t_max_period as f32,
-        );
+        // Pos embeddings. The device's two-step transpose produces t-major
+        // tokens matching the reference's layout.
+        let (pos_spec, pos_time) = self.pos_embeddings(freq_dims[2], freq_dims[3], time_samples)?;
 
         // Stage 2: the cross-transformer.
         let (spec_out, time_out) = {
@@ -2167,6 +2207,19 @@ pub struct GpuHtdemucsRunner {
     config: crate::demucs::config::HtdemucsConfig,
     /// Periodic Hann of `nfft`, uploaded once for the device iSTFT.
     istft_window: DevTensor,
+    /// The transformer's positional embeddings, built and uploaded on the first
+    /// chunk that needs them and reused by every later one.
+    pos_embeddings: std::cell::RefCell<Option<PosEmbeddings>>,
+}
+
+/// The two positional-embedding tensors plus the token counts they were built
+/// for, so a run whose shapes change rebuilds them. Dedicated, never-pooled
+/// buffers: they have to outlive the per-chunk `Arena::reset`.
+struct PosEmbeddings {
+    freq: (usize, usize),
+    time_samples: usize,
+    spec: DevTensor,
+    time: DevTensor,
 }
 
 impl GpuHtdemucsRunner {
@@ -2203,6 +2256,7 @@ impl GpuHtdemucsRunner {
             work,
             config,
             istft_window,
+            pos_embeddings: std::cell::RefCell::new(None),
         })
     }
 
