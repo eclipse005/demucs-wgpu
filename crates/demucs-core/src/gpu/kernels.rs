@@ -408,6 +408,11 @@ pub struct Kernels {
     /// in, keyed by those values: built on first use, since the shape comes from
     /// the checkpoint rather than from the code.
     col2im_fixed: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), wgpu::ComputePipeline>>,
+    /// The fused small-`oc` convolution, keyed by `(kernel_w, out_channels,
+    /// positions_per_thread, bias)`: built on first use, since the shape comes
+    /// from the checkpoint rather than from the code.
+    conv_small_oc:
+        std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, bool), wgpu::ComputePipeline>>,
     group_norm: wgpu::ComputePipeline,
     /// The split form of `group_norm`, for slices too big for one workgroup:
     /// a per-segment reduce, a per-pair stats fold, then apply.
@@ -681,6 +686,7 @@ impl Kernels {
             col2im: gpu.pipeline("col2im", &shaders::col2im(), "col2im")?,
             col2im_biased: gpu.pipeline("col2im_biased", &shaders::col2im_biased(), "col2im")?,
             col2im_fixed: std::cell::RefCell::new(std::collections::HashMap::new()),
+            conv_small_oc: std::cell::RefCell::new(std::collections::HashMap::new()),
             tanh: gpu.pipeline("tanh_activation", &shaders::tanh(), "tanh_activation")?,
             tanh_bias_in_place: gpu.pipeline(
                 "tanh_bias_in_place",
@@ -1201,12 +1207,15 @@ impl Kernels {
             &pipeline.get_bind_group_layout(0),
             &bindings,
         );
-        let name = match tile.0 {
-            shaders::BM96 => "gemm_bm96",
-            shaders::BM64 => "gemm_bm64",
-            _ => "gemm",
-        };
-        recorder.dispatch(name, pipeline, &group, grid);
+        let name = gemm_label(
+            match tile.0 {
+                shaders::BM96 => "gemm_bm96",
+                shaders::BM64 => "gemm_bm64",
+                _ => "gemm",
+            },
+            &job,
+        );
+        recorder.dispatch(&name, pipeline, &group, grid);
         Ok(())
     }
 
@@ -1322,8 +1331,9 @@ impl Kernels {
             ],
         );
         let grid = job.grid_with(shaders::BM, 64);
+        let label = gemm_label("gemm_av_row_exp", &job);
         recorder.dispatch(
-            "gemm_av_row_exp",
+            &label,
             &self.gemm_batched_bn64_row_exp,
             &group,
             grid,
@@ -1442,7 +1452,8 @@ impl Kernels {
             ],
         );
         let grid = job.grid_with(shaders::BM64, shaders::BN);
-        recorder.dispatch(name, pipeline, &group, grid);
+        let label = gemm_label(name, &job);
+        recorder.dispatch(&label, pipeline, &group, grid);
         Ok(())
     }
 
@@ -1633,7 +1644,8 @@ impl Kernels {
             &pipeline.get_bind_group_layout(0),
             &bindings,
         );
-        recorder.dispatch(name, pipeline, &group, grid);
+        let label = gemm_label(name, &job);
+        recorder.dispatch(&label, pipeline, &group, grid);
         Ok(())
     }
 
@@ -1738,7 +1750,8 @@ impl Kernels {
             &pipeline.get_bind_group_layout(0),
             &entries,
         );
-        recorder.dispatch("gemm_bias", pipeline, &group, grid);
+        let label = gemm_label("gemm_bias", &job);
+        recorder.dispatch(&label, pipeline, &group, grid);
         Ok(())
     }
 
@@ -3412,6 +3425,163 @@ impl Kernels {
         Ok(compiled)
     }
 
+    /// [`Kernels::conv2d_small_oc_into`]'s pipeline, keyed by the shape it was
+    /// generated for and built on first use.
+    fn conv_small_oc_pipeline(
+        &self,
+        gpu: &Gpu,
+        kernel_w: usize,
+        out_channels: usize,
+        positions: usize,
+        bias: bool,
+    ) -> Result<wgpu::ComputePipeline> {
+        let key = (kernel_w, out_channels, positions, bias);
+        if let Some(compiled) = self.conv_small_oc.borrow().get(&key) {
+            return Ok(compiled.clone());
+        }
+        let compiled = gpu.pipeline(
+            "conv_small_oc",
+            &shaders::conv_small_oc(kernel_w, out_channels, positions, bias),
+            "conv_small_oc",
+        )?;
+        self.conv_small_oc.borrow_mut().insert(key, compiled.clone());
+        Ok(compiled)
+    }
+
+    /// One `1 x k` convolution with few output channels, gather and GEMM fused
+    /// into a single kernel rather than an im2col pass and a tiled GEMM.
+    ///
+    /// `weight` is the layer's `(out_channels, k)` matrix **already zero-padded**
+    /// to `(pad_ceil(out_channels, BM), pad_ceil(k, BK))` — the fused kernel
+    /// ignores both paddings, but it reads the rows at the caller's pitch, so it
+    /// has to be the same tensor the GEMM would get. `x` is
+    /// `(batch, in_channels, w)` contiguous and `out` is
+    /// `(batch, out_channels, positions)` tight, both exactly as
+    /// [`Kernels::conv2d_into`] takes them.
+    ///
+    /// Only the shapes the fused form is for: a `1 x k` kernel (`kernel.0 == 1`)
+    /// on a rank-3 input (`h == 1`), unit stride, one output row, and at most
+    /// [`shaders::SMALL_OC_MAX`] output channels. `conv2d_into` takes this path
+    /// where it applies and the materialised one everywhere else; the two are
+    /// bit-identical (see `shaders::conv_small_oc`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_small_oc_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        x: &DevTensor,
+        weight: &DevTensor,
+        bias: Option<&DevTensor>,
+        out: &DevTensor,
+        shape: Im2ColShape,
+        out_channels: usize,
+    ) -> Result<()> {
+        let kt = shape.kernel.1;
+        if shape.kernel.0 != 1 || shape.h != 1 || shape.stride != (1, 1) {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form needs a 1 x k kernel on a rank-3 input with unit stride, \
+                 got {}x{} on h={} stride {:?}",
+                shape.kernel.0, shape.kernel.1, shape.h, shape.stride
+            )));
+        }
+        let (out_h, out_w) = shape.out_hw();
+        if out_h != 1 {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form writes one output row, this shape has {out_h}"
+            )));
+        }
+        if out_channels == 0 || out_channels > shaders::SMALL_OC_MAX {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form is generated for 1..={} output channels, got {out_channels}",
+                shaders::SMALL_OC_MAX
+            )));
+        }
+        if kt == 0 || kt > 8 {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form carries the tap window in registers, kt={kt} is too wide"
+            )));
+        }
+        if shape.w == 0 {
+            // The window's clamp would be `clamp(x, 0, -1)`, which WGSL resolves
+            // to a huge unsigned index. A zero-width input has no fused form.
+            return Err(Error::Shape(
+                "the fused small-oc form needs a non-empty input row".into(),
+            ));
+        }
+        let k = shape.k();
+        let k_pad = pad_ceil(k, shaders::BK);
+        let weight_len = pad_ceil(out_channels, shaders::BM) * k_pad;
+        if weight.len() < weight_len {
+            return Err(Error::Shape(format!(
+                "conv2d needs a padded weight of {weight_len} elements, the tensor holds {}",
+                weight.len()
+            )));
+        }
+        let rows = shape.batch;
+        let ic = shape.in_channels;
+        let in_w = shape.w;
+        let input_len = rows * ic * in_w;
+        if x.len() < input_len {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form reads {input_len} input elements, the tensor holds {}",
+                x.len()
+            )));
+        }
+        let out_len = rows * out_channels * out_w;
+        if out.len() < out_len {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form writes {out_len} elements, the target holds {}",
+                out.len()
+            )));
+        }
+
+        let positions = shaders::small_oc_positions(out_channels);
+        let blocks = out_w.div_ceil(positions);
+        let threads = shaders::SMALL_OC_THREADS;
+        let gx = (rows * blocks).div_ceil(threads);
+        if gx > 65535 {
+            return Err(Error::Shape(format!(
+                "the fused small-oc form needs {gx} workgroups, over the 65535 cap"
+            )));
+        }
+        let gd = self.params(
+            gpu,
+            arena,
+            [ic as u32, in_w as u32, shape.pad.1 as u32, k_pad as u32],
+        )?;
+        let ge = self.params(
+            gpu,
+            arena,
+            [out_w as u32, rows as u32, out_channels as u32, 0],
+        )?;
+        let pipeline =
+            self.conv_small_oc_pipeline(gpu, kt, out_channels, positions, bias.is_some())?;
+        let mut bindings: Vec<(&wgpu::Buffer, u64, u64)> = vec![
+            (&x.buffer, x.offset, (x.len() * 4) as u64),
+            (&weight.buffer, weight.offset, (weight.len() * 4) as u64),
+            (&out.buffer, out.offset, (out.len() * 4) as u64),
+            (&gd.buffer, gd.offset, 16),
+            (&ge.buffer, ge.offset, 16),
+        ];
+        if let Some(bias) = bias {
+            bindings.push((&bias.buffer, bias.offset, (bias.len() * 4) as u64));
+        }
+        let group = bind_group(
+            gpu,
+            "conv_small_oc",
+            &pipeline.get_bind_group_layout(0),
+            &bindings,
+        );
+        let label = if profile_convs() {
+            format!("conv_small_oc k{kt} oc{out_channels} p{positions} b{rows}")
+        } else {
+            "conv_small_oc".to_string()
+        };
+        recorder.dispatch(&label, &pipeline, &group, (gx.max(1) as u32, 1, 1));
+        Ok(())
+    }
+
     /// `(batch, rows, cols)` copied from one row pitch to another, with the
     /// destination's extra rows per batch left alone.
     ///
@@ -4684,6 +4854,26 @@ fn row_grid(rows: usize) -> (u32, u32) {
 fn profile_convs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DEMUCS_PROFILE_CONVS").is_ok())
+}
+
+/// A GEMM's timing label, with its shape appended under `DEMUCS_PROFILE_CONVS`.
+///
+/// The timings table aggregates by label, so without this every projection and
+/// every convolution lands in one `gemm_bias`/`gemm_bm64` row and the table
+/// cannot say which shape the time belongs to. Splitting it is what turns the
+/// table into FLOP/s per shape: the k values span 400x across the model, and
+/// the rate each shape reaches spans 4x, so the shape is the interesting axis
+/// and the kernel name is not. `m`/`n`/`k` are the job's own numbers (before
+/// the tiles' padding), and `b` its batch count.
+fn gemm_label(name: &'static str, job: &GemmJob) -> std::borrow::Cow<'static, str> {
+    if profile_convs() {
+        std::borrow::Cow::Owned(format!(
+            "{name} m{} n{} k{} b{}",
+            job.m, job.n, job.k, job.batches
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
 }
 
 /// Columns one thread of the `im2col` gather walks.

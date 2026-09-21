@@ -1885,6 +1885,180 @@ pub fn col2im_fixed_bake() -> bool {
         .unwrap_or(true)
 }
 
+/// The largest output-channel count [`conv_small_oc`] is generated for. Above
+/// it a GEMM tile is the right shape and this kernel's register file is not.
+pub const SMALL_OC_MAX: usize = 32;
+
+/// Whether a `1 x k` convolution with few output channels takes the fused
+/// direct form. `DEMUCS_SMALL_OC=0` restores the im2col + GEMM pair, which is
+/// how the two were compared.
+pub fn small_oc_conv() -> bool {
+    std::env::var("DEMUCS_SMALL_OC")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// [`conv_small_oc`]'s thread count.
+pub const SMALL_OC_THREADS: usize = 128;
+
+/// Output channels one thread of [`conv_small_oc`] carries. Chosen so the
+/// accumulator block stays under ~100 registers: 8 columns for the 6- and
+/// 12-channel layers, 4 for the 24-channel ones.
+pub fn small_oc_positions(out_channels: usize) -> usize {
+    if out_channels <= 12 {
+        8
+    } else {
+        4
+    }
+}
+
+/// A `(1 x k)` convolution with a small output-channel count, gather and GEMM
+/// fused: one thread computes *every* output channel for `positions` consecutive
+/// outputs, straight out of the input.
+///
+/// Why this exists, measured per chunk on the acceptance model with the GEMM
+/// timings split by shape: the DConv's `conv1` layers are `(hidden, c*k) @
+/// (c*k, t)` with `hidden` of 6, 12 and 24. As an implicit GEMM they cost
+/// 17.6 ms a chunk to do 7.1 GFLOP — 0.41 TFLOP/s against the same kernels'
+/// 2.8 on every other shape — because a 64-row tile computes 10.7x the rows
+/// `hidden` asks for, and their im2col gathers add another 13.6 ms on top. Both
+/// halves are consequences of the shape, and both go away if the kernel knows
+/// `hidden` is small: the accumulators are `out_channels * positions` registers
+/// (48 to 96) instead of a tile's worth, the input window lives in registers
+/// across all of the taps and channels that read it, and no patch matrix is
+/// written or read back.
+///
+/// The accumulation order is the GEMM's own — `fma(w, v, acc)` with `k`
+/// ascending over `(in_channel, tap)`, which is the order im2col lays the patch
+/// rows out in — so the fused result is bit-identical to the materialised one
+/// rather than merely close. `gpu_conv_small_oc.rs` holds that.
+///
+/// `positions` and `out_channels` are compile-time because every index into the
+/// register arrays has to be: the channel loop is the only dynamic one.
+pub fn conv_small_oc(
+    kernel_w: usize,
+    out_channels: usize,
+    positions: usize,
+    bias: bool,
+) -> String {
+    let window = positions + kernel_w - 1;
+    // The window's addresses and the zero mask are properties of the thread, not
+    // of the channel: the input index `pos + tap - pad` is out of the row only
+    // for the threads at either end, and those tests would otherwise be repeated
+    // for every channel. Clamped addresses keep the loads in bounds; the mask
+    // (rather than a branch) keeps them branchless, and `x * 0.0` is `+0.0` for
+    // any finite `x`, which is exactly what im2col writes for those elements.
+    let mut prologue = String::new();
+    for j in 0..window {
+        prologue.push_str(&format!(
+            "    let t{j}: i32 = wlo + {j}i;\n\
+             \x20   let i{j} = u32(clamp(t{j}, 0, in_w_max));\n\
+             \x20   let m{j} = select(0.0, 1.0, t{j} >= 0 && t{j} <= in_w_max);\n"
+        ));
+    }
+    let mut accumulators = String::new();
+    for o in 0..out_channels {
+        for p in 0..positions {
+            accumulators.push_str(&format!("    var a{o}_{p}: f32 = 0.0;\n"));
+        }
+    }
+    let mut body = String::new();
+    for j in 0..window {
+        body.push_str(&format!("        let v{j} = X[xb + i{j}] * m{j};\n"));
+    }
+    for o in 0..out_channels {
+        for t in 0..kernel_w {
+            body.push_str(&format!(
+                "        let w{o}_{t} = W[{o}u * ldw + cb + {t}u];\n"
+            ));
+        }
+    }
+    for o in 0..out_channels {
+        for t in 0..kernel_w {
+            for p in 0..positions {
+                body.push_str(&format!(
+                    "        a{o}_{p} = fma(w{o}_{t}, v{}, a{o}_{p});\n",
+                    t + p
+                ));
+            }
+        }
+    }
+    // One guard per output position rather than per element: a store past
+    // `out_w` belongs to the tile margin every caller pads its output to.
+    let mut store = String::new();
+    if bias {
+        for o in 0..out_channels {
+            store.push_str(&format!("    let b{o} = Bias[{o}u];\n"));
+        }
+    }
+    for p in 0..positions {
+        store.push_str(&format!("    if (pos0 + {p}u < out_w) {{\n"));
+        for o in 0..out_channels {
+            store.push_str(&format!(
+                "        Y[yb + {o}u * out_w + pos0 + {p}u] = a{o}_{p}{add};\n",
+                add = if bias { format!(" + b{o}") } else { String::new() }
+            ));
+        }
+        store.push_str("    }\n");
+    }
+    let bias_decl = if bias {
+        "@group(0) @binding(5) var<storage, read> Bias: array<f32>;"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // in_channels, in_w, pad, weight row stride
+@group(0) @binding(4) var<uniform> ge: vec4<u32>;  // out_w, rows, out_channels, _
+{bias_decl}
+const P: u32 = {positions}u;
+const OC: u32 = {out_channels}u;
+const KT: u32 = {kernel_w}u;
+
+@compute @workgroup_size({threads})
+fn conv_small_oc(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let ic = gd.x;
+    let in_w = gd.y;
+    let pad = gd.z;
+    let ldw = gd.w;
+    let out_w = ge.x;
+    let rows = ge.y;
+
+    // One thread per (row, block of `P` outputs), the blocks walking the row
+    // first so a warp's stores stay contiguous.
+    let blocks = (out_w + P - 1u) / P;
+    let row = gid.x / blocks;
+    if (row >= rows) {{ return; }}
+    let pos0 = (gid.x % blocks) * P;
+
+    let in_w_max = i32(in_w) - 1;
+    let wlo = i32(pos0) - i32(pad);
+{prologue}
+{accumulators}
+    let xrow = row * ic * in_w;
+    let yb = row * OC * out_w;
+    for (var c = 0u; c < ic; c = c + 1u) {{
+        let xb = xrow + c * in_w;
+        // The tap block's weights are one contiguous run per output channel.
+        let cb = c * KT;
+{body}    }}
+{store}}}
+"#,
+        bias_decl = bias_decl,
+        positions = positions,
+        out_channels = out_channels,
+        kernel_w = kernel_w,
+        threads = SMALL_OC_THREADS,
+        prologue = prologue,
+        accumulators = accumulators,
+        body = body,
+        store = store,
+    )
+}
+
 fn col2im_impl(fixed: Option<((usize, usize), (usize, usize))>, bias: bool) -> String {
     let (consts, kh_src, kw_src, sh_src, sw_src) = match fixed {
         Some(((kh, kw), (sh, sw))) => (

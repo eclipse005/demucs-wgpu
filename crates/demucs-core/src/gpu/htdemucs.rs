@@ -941,63 +941,90 @@ fn dconv_stage(
         // chunk's block of the scratch is `span * k_pad` rows of `pitch`, whose
         // offset is a multiple of 8 because `k_pad` and `pitch` are multiples
         // of `BK` and `BN`.
-        let k_pad = pad_ceil(layer.conv1.k(), BK);
-        let pitch = pad_ceil(time, BN_C);
-        // Every row's patches live simultaneously (the GEMM reads them all
-        // after the gathers), so the scratch has to hold the whole
-        // `rows * k_pad * pitch` plane, not one chunk of it. Growing is fine
-        // here: the per-layer plane is computed before the gather loop and the
-        // previous buffer returns to the pool.
-        let needed = rows * k_pad * pitch;
-        scratch_for(arena, gpu, scratch, needed, "dconv.scratch")?;
-        let chunk_rows = (60_000 / k_pad.max(1)).max(1);
-        let mut row = 0usize;
-        while row < rows {
-            let span = chunk_rows.min(rows - row);
-            // Each chunk is a contiguous (span, c, time) slab of `current`.
-            let in_slab = current.slice(
-                row * layer.conv1.in_channels * time,
-                vec![span, layer.conv1.in_channels, time],
-            )?;
-            let patch_slab = scratch.slice(row * k_pad * pitch, vec![span * k_pad * pitch])?;
-            kernels.conv2d_gather_into(
+        // The fused form for the small-`hidden` layers: 6, 12 and 24 output
+        // channels is far too few rows for a GEMM tile (a 64-row tile computes
+        // 10.7x the rows asked for), and each of these layers also pays an
+        // im2col gather of its own. A kernel that knows `hidden` is small keeps
+        // the accumulators in registers instead of in a tile and reads the input
+        // window itself, with no patch matrix anywhere. Bit-identical to the
+        // pair below — `shaders::conv_small_oc` argues that and
+        // `gpu_conv_small_oc.rs` holds it — so the only differences are the
+        // dispatch count and the time.
+        let conv1_shape = Im2ColShape {
+            batch: rows,
+            in_channels: layer.conv1.in_channels,
+            h: 1,
+            w: time,
+            kernel: layer.conv1.kernel,
+            stride: (1, 1),
+            pad: layer.conv1.pad,
+        };
+        // The condition mirrors `conv2d_small_oc_into`'s own checks rather than
+        // guessing at them: a shape outside them must fall back to the pair
+        // below, not fail the separation.
+        let fused = shaders::small_oc_conv()
+            && layer.conv1.kernel.0 == 1
+            && layer.conv1.kernel.1 <= 8
+            && layer.conv1.pad.0 == 0
+            && layer.hidden <= shaders::SMALL_OC_MAX;
+        if fused {
+            kernels.conv2d_small_oc_into(
                 gpu,
                 arena,
                 &mut recorder,
-                &in_slab,
-                &patch_slab,
-                Im2ColShape {
-                    batch: span,
-                    in_channels: layer.conv1.in_channels,
-                    h: 1,
-                    w: time,
-                    kernel: layer.conv1.kernel,
-                    stride: (1, 1),
-                    pad: layer.conv1.pad,
-                },
+                &current,
+                &layer.conv1.weight,
+                Some(&layer.conv1.bias),
+                &conv1_out,
+                conv1_shape,
+                layer.hidden,
             )?;
-            row += span;
+        } else {
+            let k_pad = pad_ceil(layer.conv1.k(), BK);
+            let pitch = pad_ceil(time, BN_C);
+            // Every row's patches live simultaneously (the GEMM reads them all
+            // after the gathers), so the scratch has to hold the whole
+            // `rows * k_pad * pitch` plane, not one chunk of it. Growing is fine
+            // here: the per-layer plane is computed before the gather loop and
+            // the previous buffer returns to the pool.
+            let needed = rows * k_pad * pitch;
+            scratch_for(arena, gpu, scratch, needed, "dconv.scratch")?;
+            let chunk_rows = (60_000 / k_pad.max(1)).max(1);
+            let mut row = 0usize;
+            while row < rows {
+                let span = chunk_rows.min(rows - row);
+                // Each chunk is a contiguous (span, c, time) slab of `current`.
+                let in_slab = current.slice(
+                    row * layer.conv1.in_channels * time,
+                    vec![span, layer.conv1.in_channels, time],
+                )?;
+                let patch_slab = scratch.slice(row * k_pad * pitch, vec![span * k_pad * pitch])?;
+                kernels.conv2d_gather_into(
+                    gpu,
+                    arena,
+                    &mut recorder,
+                    &in_slab,
+                    &patch_slab,
+                    Im2ColShape {
+                        batch: span,
+                        ..conv1_shape
+                    },
+                )?;
+                row += span;
+            }
+            kernels.conv2d_gemm_into(
+                gpu,
+                arena,
+                &mut recorder,
+                &layer.conv1.weight,
+                &current,
+                scratch,
+                &conv1_out,
+                conv1_shape,
+                layer.hidden,
+                Some(&layer.conv1.bias),
+            )?;
         }
-        kernels.conv2d_gemm_into(
-            gpu,
-            arena,
-            &mut recorder,
-            &layer.conv1.weight,
-            &current,
-            scratch,
-            &conv1_out,
-            Im2ColShape {
-                batch: rows,
-                in_channels: layer.conv1.in_channels,
-                h: 1,
-                w: time,
-                kernel: layer.conv1.kernel,
-                stride: (1, 1),
-                pad: layer.conv1.pad,
-            },
-            layer.hidden,
-            Some(&layer.conv1.bias),
-        )?;
         if trace.wants(&format!("{name}.conv1")) {
             record_tensor(gpu, &mut recorder, &conv1_out, &format!("{name}.conv1"), trace)?;
         }
