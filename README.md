@@ -178,9 +178,9 @@ attention's softmax now writes only the per-row `(max, 1/Σexp)` and the `P·V` 
 exponential into its own `A` staging, so the `(heads·tokens, tokens)` probability matrix is never
 materialised, and the norm kernels no longer walk their tensors strided.
 
-The two `176.3 s track` rows above predate the chunk-loop pipeline and the residual epilogues (§11.14
-and §11.15 of `GEMM_HANDOFF.md`); they have not been re-measured, and the same 1.13x applies to the
-port side.
+The two `176.3 s track` rows above predate the chunk-loop pipeline, the residual epilogues and the
+conv bias fold (§11.14-§11.16 of `GEMM_HANDOFF.md`); they have not been re-measured, and the same
+~1.17x applies to the port side.
 
 ## Acceptance baseline
 
@@ -196,17 +196,18 @@ because the original mix that earlier rounds used is no longer on disk).
 
 | Input | Reference (CUDA) | This port (Vulkan) | Gap | SNR vs reference |
 |-------|------------------|--------------------|-----|------------------|
-| `clip20.wav` | 2.22 s / 8.99x | 1.12 s / **17.86x** | port 1.99x ahead | 125.34 dB |
-| `mix176.wav` | 8.08 s / **21.81x** | 7.96 s / **22.15x** | port 1.01x ahead | 127.17 dB |
+| `clip20.wav` | 2.22 s / 8.99x | 1.08 s / **18.58x** | port 2.07x ahead | 125.34 dB |
+| `mix176.wav` | 8.04 s / **21.92x** | 7.82 s / **22.56x** | port 1.03x ahead | 127.17 dB |
 
-(Three alternating runs of each side in one session — reference 8.12/7.66/8.08 s, port 7.93/7.98/7.96 s
-— so quote the pair rather than the digit: this machine drifts ±4%, and the reference's own spread
-covers this one. The 20 s row carries both sides' warm-up over a handful of chunks; the 176.3 s row is
-the one to compare, and there the pair is a draw — 251 ms per chunk against the reference's 256 ms.
-Two changes got it here: the chunk loop queues a segment and resolves the one before it (§11.14 of
-`GEMM_HANDOFF.md`), and the residuals of both block types now ride their producer's epilogue (§11.15).
-What is left is the device's own ~240 ms of kernel time per chunk — 190 ms of it the GEMM family, where
-cuBLAS reaches 5.0 TFLOP/s on these shapes on this card and the port's kernels 3.0-3.4.)
+(Three alternating runs of each side in one session — reference 8.04/8.07/8.04 s, port
+7.82/7.82/7.81 s — so quote the pair rather than the digit: this machine drifts ±4%. The 20 s row
+carries both sides' warm-up over a handful of chunks; the 176.3 s row is the one to compare, and
+there the port is **2.8% ahead** — 252 ms per chunk against the reference's 259 ms. Three paired
+changes got it here: the chunk loop queues a segment and resolves the one before it (§11.14 of
+`GEMM_HANDOFF.md`), the residuals of both block types ride their producer's epilogue (§11.15), and a
+convolution's bias rides its GEMM's store (§11.16). What is left is the device's own ~236 ms of
+kernel time per chunk, 190 ms of it the GEMM family — where cuBLAS reaches 5.0 TFLOP/s on these
+shapes on this card and the port's kernels 3.0-3.4.)
 
 
 ## Project layout

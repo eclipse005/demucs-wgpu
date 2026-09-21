@@ -327,6 +327,13 @@ pub struct Kernels {
     gemm_batched_bm64_bn128: wgpu::ComputePipeline,
     gemm_batched_bm64_bn128_coalesced: wgpu::ComputePipeline,
     gemm_batched_bm96_bn128: wgpu::ComputePipeline,
+    /// The batched tiles with the convolution's bias folded into the store.
+    /// A conv's bias runs along its output channels, which these GEMMs lay out
+    /// along M, so it cannot ride the `nn.Linear` epilogue's `Bias[col]`.
+    gemm_batched_row_bias: wgpu::ComputePipeline,
+    gemm_batched_bm64_bn128_row_bias: wgpu::ComputePipeline,
+    gemm_batched_bm64_bn128_coalesced_row_bias: wgpu::ComputePipeline,
+    gemm_batched_bm96_bn128_row_bias: wgpu::ComputePipeline,
     /// The same tile with the im2col gather folded into its `B` staging: a
     /// convolution that never materialises a patch matrix.
     gemm_conv_direct: wgpu::ComputePipeline,
@@ -486,6 +493,26 @@ impl Kernels {
             gemm_batched_bm96_bn128: gpu.pipeline(
                 "gemm_f32_batched_bm96_bn128",
                 &shaders::gemm_batched_bm96_bn128(),
+                "gemm",
+            )?,
+            gemm_batched_row_bias: gpu.pipeline(
+                "gemm_f32_batched_row_bias",
+                &shaders::gemm_batched_row_bias(shaders::Tile::square(), false),
+                "gemm",
+            )?,
+            gemm_batched_bm64_bn128_row_bias: gpu.pipeline(
+                "gemm_f32_batched_bm64_bn128_row_bias",
+                &shaders::gemm_batched_row_bias(shaders::Tile::bm64_bn128(), false),
+                "gemm",
+            )?,
+            gemm_batched_bm64_bn128_coalesced_row_bias: gpu.pipeline(
+                "gemm_f32_batched_bm64_bn128_coalesced_row_bias",
+                &shaders::gemm_batched_row_bias(shaders::Tile::bm64_bn128(), true),
+                "gemm",
+            )?,
+            gemm_batched_bm96_bn128_row_bias: gpu.pipeline(
+                "gemm_f32_batched_bm96_bn128_row_bias",
+                &shaders::gemm_batched_row_bias(shaders::Tile::bm96_bn128(), false),
                 "gemm",
             )?,
             gemm_conv_direct: gpu.pipeline(
@@ -1128,6 +1155,7 @@ impl Kernels {
         job: GemmJob,
         pipeline: &wgpu::ComputePipeline,
         tile: (usize, usize),
+        bias: Option<&DevTensor>,
     ) -> Result<()> {
         if job.m == 0 || job.n == 0 || job.k == 0 {
             return Ok(());
@@ -1150,16 +1178,20 @@ impl Kernels {
         };
         let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
         let grid = job.grid_with(tile.0, tile.1);
+        let mut bindings: Vec<(&wgpu::Buffer, u64, u64)> = vec![
+            (&a.buffer, a.offset, (a.len() * 4) as u64),
+            (&b.buffer, b.offset, (b.len() * 4) as u64),
+            (&c.buffer, c.offset, (c.len() * 4) as u64),
+            (&params.buffer, params.offset, 64),
+        ];
+        if let Some(bias) = bias {
+            bindings.push((&bias.buffer, bias.offset, (bias.len() * 4) as u64));
+        }
         let group = bind_group(
             gpu,
             "gemm",
             &pipeline.get_bind_group_layout(0),
-            &[
-                (&a.buffer, a.offset, (a.len() * 4) as u64),
-                (&b.buffer, b.offset, (b.len() * 4) as u64),
-                (&c.buffer, c.offset, (c.len() * 4) as u64),
-                (&params.buffer, params.offset, 64),
-            ],
+            &bindings,
         );
         let name = match tile.0 {
             shaders::BM96 => "gemm_bm96",
@@ -1420,6 +1452,49 @@ impl Kernels {
         c: &DevTensor,
         job: GemmJob,
     ) -> Result<()> {
+        self.gemm_into_job(gpu, arena, recorder, a, b, c, job, None)
+    }
+
+    /// [`Kernels::gemm_into`] in the one form that can fold a bias in: a batched,
+    /// non-transposed, 128-wide-N job, with the bias indexed by the row — the
+    /// convolution's output channel.
+    ///
+    /// The convolution's bias cannot ride the `nn.Linear` epilogue: that one
+    /// adds `Bias[col]` where this one needs `Bias[row]`, because a conv's output
+    /// channels are the GEMM's M axis and a Linear's are its N.
+    pub fn gemm_into_row_bias(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        a: &DevTensor,
+        b: &DevTensor,
+        c: &DevTensor,
+        job: GemmJob,
+        bias: &DevTensor,
+    ) -> Result<()> {
+        if job.transb || job.n <= shaders::Tile::bm64_bn64().bn {
+            return Err(Error::Gpu(format!(
+                "the row-bias epilogue is compiled for a batched, non-transposed GEMM with a \
+                 128-wide N tile, not m {} n {} k {} batches {} transb {}",
+                job.m, job.n, job.k, job.batches, job.transb
+            )));
+        }
+        self.gemm_into_job(gpu, arena, recorder, a, b, c, job, Some(bias))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_into_job(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        a: &DevTensor,
+        b: &DevTensor,
+        c: &DevTensor,
+        job: GemmJob,
+        row_bias: Option<&DevTensor>,
+    ) -> Result<()> {
         if job.m == 0 || job.n == 0 || job.k == 0 {
             return Ok(());
         }
@@ -1512,31 +1587,43 @@ impl Kernels {
         // time axis' 801 queries would lose far more to the smaller tile's
         // worse loads-per-FMA than they gain from the padding.
         let narrow_m = job.m <= 64;
-        let (pipeline, name, tile) = match (job.batches == 1, job.transb, job.n <= 64) {
-            (_, true, true) if narrow_m => (&self.gemm_transb_bm64, "gemm_transb_bm64", small),
-            (_, true, true) => (&self.gemm_transb_bn64, "gemm_transb_bn64", n64),
-            (false, false, true) if narrow_m => {
-                (&self.gemm_batched_bm64, "gemm_batched_bm64", small)
+        let (pipeline, name, tile) = if row_bias.is_some() {
+            (
+                &self.gemm_batched_row_bias,
+                "gemm_batched_row_bias",
+                square,
+            )
+        } else {
+            match (job.batches == 1, job.transb, job.n <= 64) {
+                (_, true, true) if narrow_m => (&self.gemm_transb_bm64, "gemm_transb_bm64", small),
+                (_, true, true) => (&self.gemm_transb_bn64, "gemm_transb_bn64", n64),
+                (false, false, true) if narrow_m => {
+                    (&self.gemm_batched_bm64, "gemm_batched_bm64", small)
+                }
+                (false, false, true) => (&self.gemm_batched_bn64, "gemm_batched_bn64", n64),
+                (true, false, _) => (&self.gemm, "gemm", square),
+                (false, false, false) => (&self.gemm_batched, "gemm_batched", square),
+                (true, true, false) if shaders::transb_plain_for_single_batch() => {
+                    (&self.gemm_transb_plain, "gemm_transb", square)
+                }
+                (_, true, false) => (&self.gemm_transb, "gemm_transb", square),
             }
-            (false, false, true) => (&self.gemm_batched_bn64, "gemm_batched_bn64", n64),
-            (true, false, _) => (&self.gemm, "gemm", square),
-            (false, false, false) => (&self.gemm_batched, "gemm_batched", square),
-            (true, true, false) if shaders::transb_plain_for_single_batch() => {
-                (&self.gemm_transb_plain, "gemm_transb", square)
-            }
-            (_, true, false) => (&self.gemm_transb, "gemm_transb", square),
         };
         let grid = job.grid_with(tile.0, tile.1);
+        let mut bindings: Vec<(&wgpu::Buffer, u64, u64)> = vec![
+            (&a.buffer, a.offset, (a.len() * 4) as u64),
+            (&b.buffer, b.offset, (b.len() * 4) as u64),
+            (&c.buffer, c.offset, (c.len() * 4) as u64),
+            (&params.buffer, params.offset, 64),
+        ];
+        if let Some(bias) = row_bias {
+            bindings.push((&bias.buffer, bias.offset, (bias.len() * 4) as u64));
+        }
         let group = bind_group(
             gpu,
             "gemm",
             &pipeline.get_bind_group_layout(0),
-            &[
-                (&a.buffer, a.offset, (a.len() * 4) as u64),
-                (&b.buffer, b.offset, (b.len() * 4) as u64),
-                (&c.buffer, c.offset, (c.len() * 4) as u64),
-                (&params.buffer, params.offset, 64),
-            ],
+            &bindings,
         );
         recorder.dispatch(name, pipeline, &group, grid);
         Ok(())
@@ -3153,6 +3240,13 @@ impl Kernels {
         // one batched dispatch all along, so this also collapses `batches`
         // dispatches into one.
         let per_batch = k_pad * pitch;
+        // Whether the bias can ride the GEMM's store. The square arm's twin is
+        // compiled for a 128-wide N tile, which is the arm's own condition.
+        let bm64_arm = out_channels <= 64 && shaders::bm64_for_convs();
+        let bm96_arm = out_channels <= 192 && shaders::bm96_for_convs();
+        let fold = bias.is_some()
+            && shaders::conv_bias_fuse()
+            && (bm64_arm || bm96_arm || positions > shaders::Tile::bm64_bn64().bn);
         let job = GemmJob {
             m: out_channels,
             n: positions,
@@ -3203,10 +3297,11 @@ impl Kernels {
             // `shaders::gemm_bm64_coalesced`. `DEMUCS_GEMM_B_WALK` switches it,
             // which is how the two were compared.
             let coalesced = shaders::coalesced_b_for_convs();
-            let pipeline = if coalesced {
-                &self.gemm_batched_bm64_bn128_coalesced
-            } else {
-                &self.gemm_batched_bm64_bn128
+            let pipeline = match (coalesced, fold) {
+                (true, true) => &self.gemm_batched_bm64_bn128_coalesced_row_bias,
+                (true, false) => &self.gemm_batched_bm64_bn128_coalesced,
+                (false, true) => &self.gemm_batched_bm64_bn128_row_bias,
+                (false, false) => &self.gemm_batched_bm64_bn128,
             };
             self.gemm_into_tile(
                 gpu,
@@ -3218,8 +3313,14 @@ impl Kernels {
                 job,
                 pipeline,
                 (shaders::BM64, shaders::BN),
+                bias.filter(|_| fold),
             )?;
         } else if out_channels <= 192 && shaders::bm96_for_convs() {
+            let pipeline = if fold {
+                &self.gemm_batched_bm96_bn128_row_bias
+            } else {
+                &self.gemm_batched_bm96_bn128
+            };
             self.gemm_into_tile(
                 gpu,
                 arena,
@@ -3228,13 +3329,28 @@ impl Kernels {
                 patches,
                 out,
                 job,
-                &self.gemm_batched_bm96_bn128,
+                pipeline,
                 (shaders::BM96, shaders::BN),
+                bias.filter(|_| fold),
+            )?;
+        } else if fold {
+            // The square batched tile has a row-bias twin only in its 128-wide
+            // N form; a narrower N would take `gemm_batched_bn64`, which does
+            // not, so those keep the separate pass.
+            self.gemm_into_row_bias(
+                gpu,
+                arena,
+                recorder,
+                weight,
+                patches,
+                out,
+                job,
+                bias.expect("fold implies a bias"),
             )?;
         } else {
             self.gemm_into(gpu, arena, recorder, weight, patches, out, job)?;
         }
-        if let Some(bias) = bias {
+        if let (Some(bias), false) = (bias, fold) {
             // One pass over the whole `(batch, out_channels, positions)`
             // output: the bias repeats every `out_channels` rows.
             self.add_row_bias_in_place(

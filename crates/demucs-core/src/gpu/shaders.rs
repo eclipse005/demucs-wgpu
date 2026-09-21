@@ -447,11 +447,20 @@ pub enum GemmEpilogue {
     Residual,
     /// `C = acc + Bias[col] + C`.
     BiasResidual,
+    /// `C = acc + Bias[row]`: the convolution's bias, which runs along the
+    /// output channels — this GEMM's M axis, not the Linear's N.
+    RowBias,
 }
 
 impl GemmEpilogue {
     fn has_bias(self) -> bool {
-        matches!(self, GemmEpilogue::Bias | GemmEpilogue::GeluBias | GemmEpilogue::BiasResidual)
+        matches!(
+            self,
+            GemmEpilogue::Bias
+                | GemmEpilogue::GeluBias
+                | GemmEpilogue::BiasResidual
+                | GemmEpilogue::RowBias
+        )
     }
 
     fn has_residual(self) -> bool {
@@ -461,6 +470,28 @@ impl GemmEpilogue {
 
 pub fn gemm_bias() -> String {
     gemm_impl_with(Tile::default(), true, false, GemmEpilogue::Bias)
+}
+
+/// The batched form with the row bias: what a convolution's GEMM can fold in
+/// instead of running `add_row_bias_in_place` over its own output.
+pub fn gemm_batched_row_bias(tile: Tile, coalesced_b: bool) -> String {
+    gemm_impl_full(
+        tile,
+        true,
+        false,
+        GemmEpilogue::RowBias,
+        coalesced_b,
+        false,
+        false,
+    )
+}
+
+/// Whether a convolution's bias rides its GEMM's epilogue. `DEMUCS_CONV_BIAS_FUSE=0`
+/// takes the extra pass instead.
+pub fn conv_bias_fuse() -> bool {
+    std::env::var("DEMUCS_CONV_BIAS_FUSE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Single-batch `transb` with the Linear bias folded into the store.
@@ -940,7 +971,13 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
         epilogue.push_str(&format!("    if (gm{i} < gd.m) {{\n"));
         for j in 0..tn {
             let mut write = format!("c{i}_{j}");
-            if ep.has_bias() {
+            if ep == GemmEpilogue::RowBias {
+                // The convolution's bias runs along the output channels, which
+                // the GEMM lays out along M: `add_row_bias_in_place` adds
+                // `Bias[row % bias_rows]` with `row` the channel, and `gm{i}` is
+                // that same index within the tile.
+                write = format!("{write} + Bias[gm{i}]");
+            } else if ep.has_bias() {
                 write = format!("{write} + Bias[gn{j}]");
             }
             if ep.has_residual() {

@@ -8,7 +8,7 @@
 use demucs_core::fixtures::compare;
 use demucs_core::gpu::arena::{Arena, DevTensor, Recorder};
 use demucs_core::gpu::kernels::{pad_ceil, Im2ColShape, Kernels};
-use demucs_core::gpu::shaders::{BK, BM, BN};
+use demucs_core::gpu::shaders::{self, BK, BM, BN};
 use demucs_core::gpu::Gpu;
 
 fn gpu_or_skip() -> Option<Gpu> {
@@ -147,10 +147,14 @@ fn check(
             out_channels,
         )
         .unwrap();
+    // The bias rides the GEMM's own store (a conv's bias runs along its output
+    // channels, which this GEMM lays out along M); `DEMUCS_CONV_BIAS_FUSE=0`
+    // restores the extra pass over every batch.
+    let expected = if shaders::conv_bias_fuse() { 2 } else { 3 };
     assert_eq!(
         recorder.dispatches(),
-        3,
-        "one gather, then one batched GEMM and one bias pass over every batch"
+        expected,
+        "one gather, then one batched GEMM with the bias folded into it (or a bias pass)"
     );
     recorder.submit(gpu).unwrap();
 

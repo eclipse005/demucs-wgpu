@@ -1031,40 +1031,59 @@ fn dconv_stage(
 
         // conv2: C[b] = W @ X[b], one (2C, hidden) @ (hidden, time) per row,
         // batched over rows. A is the shared weight; B are the normed rows; C
-        // is one (channels, time) matrix per batch with tight rows.
+        // is one (channels, time) matrix per batch with tight rows. Its bias
+        // runs along the output channels — this GEMM's M axis — so it rides the
+        // row-bias epilogue instead of a second pass over the output.
         let channels = layer.channels * 2;
         let conv2_out = arena.tensor(gpu, &[rows, channels, time], &format!("{name}.conv2"))?;
-        if std::env::var("DEMUCS_CONV2_PROBE").is_ok() {
+        let conv2_job = GemmJob {
+            m: channels,
+            n: time,
+            k: layer.hidden,
+            lda: pad_ceil(layer.hidden, BK),
+            ldb: time,
+            ldc: time,
+            batches: rows,
+            inner_count: 1,
+            a_outer: 0,
+            a_inner: 0,
+            b_outer: layer.hidden * time,
+            b_inner: 0,
+            c_outer: channels * time,
+            c_inner: 0,
+            transb: false,
+        };
+        let conv2_probe = std::env::var("DEMUCS_CONV2_PROBE").is_ok();
+        // The row-bias twin is compiled for the square batched tile, which is
+        // what a 128-wide N selects.
+        let fold_conv2_bias =
+            !conv2_probe && shaders::conv_bias_fuse() && time > shaders::Tile::bm64_bn64().bn;
+        if conv2_probe {
             // Probe: a plain copy instead of the GEMM. If the trace then shows
             // norm1's values, the plumbing is fine and the GEMM dispatch itself
             // is what fails.
             kernels.copy(gpu, arena, &mut recorder, &normed, &conv2_out, normed.len())?;
+        } else if fold_conv2_bias {
+            kernels.gemm_into_row_bias(
+                gpu,
+                arena,
+                &mut recorder,
+                &layer.conv2.weight,
+                &normed,
+                &conv2_out,
+                conv2_job,
+                &layer.conv2.bias,
+            )?;
         } else {
-        kernels.gemm_into(
-            gpu,
-            arena,
-            &mut recorder,
-            &layer.conv2.weight,
-            &normed,
-            &conv2_out,
-            GemmJob {
-                m: channels,
-                n: time,
-                k: layer.hidden,
-                lda: pad_ceil(layer.hidden, BK),
-                ldb: time,
-                ldc: time,
-                batches: rows,
-                inner_count: 1,
-                a_outer: 0,
-                a_inner: 0,
-                b_outer: layer.hidden * time,
-                b_inner: 0,
-                c_outer: channels * time,
-                c_inner: 0,
-                transb: false,
-            },
-        )?;
+            kernels.gemm_into(
+                gpu,
+                arena,
+                &mut recorder,
+                &layer.conv2.weight,
+                &normed,
+                &conv2_out,
+                conv2_job,
+            )?;
         }
 
         if trace.wants(&format!("{name}.norm1.after")) {
@@ -1079,20 +1098,22 @@ fn dconv_stage(
             )?;
         }
 
-        // conv2's bias: the batched GEMM has no epilogue, so fold it in with
-        // an identity affine (scale 1, shift = bias, per output channel).
-        kernels.channel_affine_act_in_place(
-            gpu,
-            arena,
-            &mut recorder,
-            &conv2_out,
-            &layer.conv2_ones,
-            &layer.conv2.bias,
-            rows,
-            channels,
-            time,
-            Activation::Identity,
-        )?;
+        if !fold_conv2_bias {
+            // conv2's bias, the long way: an identity affine (scale 1, shift =
+            // bias, per output channel) over the whole output.
+            kernels.channel_affine_act_in_place(
+                gpu,
+                arena,
+                &mut recorder,
+                &conv2_out,
+                &layer.conv2_ones,
+                &layer.conv2.bias,
+                rows,
+                channels,
+                time,
+                Activation::Identity,
+            )?;
+        }
 
         if trace.wants(&format!("{name}.conv2")) {
             // Recorded after the bias fold: the host's conv module output
