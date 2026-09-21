@@ -12,7 +12,7 @@ use crate::demucs::config::{HtdemucsArch, HtdemucsConfig};
 use crate::demucs::ops::{
     add_in_place_nd, add_nd, channels_to_leading_freq_into, conv1d, conv2d,
     conv_transpose1d, conv_transpose2d, gelu_in_place, glu, group_norm, group_norm_glu,
-    leading_freq_to_channels_into, layer_norm_rows, linear_3d,
+    leading_freq_to_channels_into, layer_norm_rows, linear_3d, uninit_array,
 };
 use crate::demucs::spec::{
     pack_complex_as_channels, pad_for_ispec, unpack_channels_as_complex, DemucsSpec,
@@ -581,13 +581,13 @@ impl Htdemucs {
         gelu_in_place(y.as_slice_mut().expect("standard layout"));
 
         let (batch, channels, freqs, frames) = y.dim();
-        let mut flat = Array3::<f32>::zeros((batch * freqs, channels, frames));
+        let mut flat = uninit_array((batch * freqs, channels, frames));
         channels_to_leading_freq_into(&y, &mut flat)?;
         flat = dconv_forward(&layer.dconv, &flat)?;
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), flat.view().into_dyn());
         }
-        let mut y = Array4::<f32>::zeros((batch, channels, freqs, frames));
+        let mut y = uninit_array((batch, channels, freqs, frames));
         leading_freq_to_channels_into(&flat, batch, channels, freqs, &mut y)?;
 
         let rewritten = conv2d(
@@ -677,7 +677,7 @@ impl Htdemucs {
         };
 
         let (batch, channels, freqs, frames) = gated.dim();
-        let mut flat = Array3::<f32>::zeros((batch * freqs, channels, frames));
+        let mut flat = uninit_array((batch * freqs, channels, frames));
         channels_to_leading_freq_into(&gated, &mut flat)?;
         flat = {
             let _scope = profile::scope("dec.dconv");
@@ -686,7 +686,7 @@ impl Htdemucs {
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), flat.view().into_dyn());
         }
-        let mut pre = Array4::<f32>::zeros((batch, channels, freqs, frames));
+        let mut pre = uninit_array((batch, channels, freqs, frames));
         leading_freq_to_channels_into(&flat, batch, channels, freqs, &mut pre)?;
 
         let upsampled = {
@@ -1121,7 +1121,7 @@ fn multi_head_attention(
     );
 
     let _heads = profile::scope("transformer.attn.heads");
-    let mut context = Array3::<f32>::zeros((batch * heads, n_q, d_head));
+    let mut context = uninit_array((batch * heads, n_q, d_head));
     {
         let dst = context.as_slice_mut().expect("standard layout");
         let chunk = n_q * d_head;
@@ -1134,7 +1134,7 @@ fn multi_head_attention(
                 // The flat projection is (b*n, h*dh) row-major, so the head's
                 // rows are d_head-wide runs h*d_head apart.
                 let gather = |flat: &[f32], base: usize, n: usize| {
-                    let mut head = Array2::<f32>::zeros((n, d_head));
+                    let mut head = uninit_array((n, d_head));
                     let out = head.as_slice_mut().expect("standard layout");
                     for (i, row) in out.chunks_mut(d_head).enumerate() {
                         let src = base + i * heads * d_head + h * d_head;
@@ -1153,7 +1153,7 @@ fn multi_head_attention(
     let _project = profile::scope("transformer.attn.proj");
     // context is (batch, heads, n_q, d_head)-logical; merging the heads back is
     // a straight copy to (batch, n_q, dim).
-    let mut merged = Array3::<f32>::zeros((batch, n_q, dim));
+    let mut merged = uninit_array((batch, n_q, dim));
     {
         let _merge = profile::scope("transformer.attn.merge");
         let src = context.as_slice().expect("standard layout");

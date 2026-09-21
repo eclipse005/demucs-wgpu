@@ -101,7 +101,7 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
             .expect("the output shape matches");
     }
 
-    let mut flat = vec![0.0f32; b * oc * plane];
+    let mut flat = uninit_vec(b * oc * plane);
     let rows_per_block = (PATCH_BLOCK_ELEMENTS / (k * out_w).max(1)).max(1);
     let blocks: Vec<(usize, usize)> = {
         let mut blocks = Vec::new();
@@ -119,7 +119,7 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
         for &(row0, rows_here) in &blocks {
             let positions = rows_here * out_w;
             // 1. im2col: one row of the patch matrix per (ic, ky, kx) tap.
-            let mut patches = vec![0.0f32; k * positions];
+            let mut patches = uninit_vec(k * positions);
             patches
                 .par_chunks_mut(positions)
                 .enumerate()
@@ -375,7 +375,7 @@ pub fn conv1d(x: &Array3<f32>, w: &ConvW, stride: usize, pad: usize, dilation: u
     if direct {
         let k = w.kernel()[0];
         let out_t = t + 2 * pad - (dilation * (k - 1) + 1) + 1;
-        let mut out = Array3::<f32>::zeros((b, w.out_channels(), out_t));
+        let mut out = uninit_array((b, w.out_channels(), out_t));
         conv1d_stride1_into(&x.view(), w, &mut out, pad, dilation);
         return out;
     }
@@ -436,7 +436,7 @@ pub fn conv_transpose2d<S: ndarray::Data<Elem = f32> + Sync>(
         }
     }
 
-    let mut out = Array4::<f32>::zeros((b, oc, out_h, out_w));
+    let mut out = uninit_array((b, oc, out_h, out_w));
     for (channel, value) in w.bias.iter().enumerate() {
         out.slice_mut(s![.., channel, .., ..]).fill(*value);
     }
@@ -571,7 +571,7 @@ pub fn layer_norm_rows(x: &Array2<f32>, weight: &[f32], bias: &[f32]) -> Result<
             weight.len()
         )));
     }
-    let mut out = Array2::<f32>::zeros((rows, dim));
+    let mut out = uninit_array((rows, dim));
     out.axis_iter_mut(Axis(0))
         .into_par_iter()
         .zip(x.axis_iter(Axis(0)).into_par_iter())
@@ -599,7 +599,7 @@ pub fn glu<D: ndarray::Dimension>(x: &ndarray::Array<f32, D>) -> Result<ndarray:
     let inner: usize = shape[2..].iter().product();
     let mut out_shape = shape.clone();
     out_shape[1] = half;
-    let mut out = vec![0.0f32; b * half * inner];
+    let mut out = uninit_vec(b * half * inner);
     let source = x
         .as_slice()
         .ok_or_else(|| Error::Shape("GLU needs a standard-layout tensor".into()))?;
@@ -667,7 +667,7 @@ pub fn group_norm_glu<D: ndarray::Dimension>(
         .ok_or_else(|| Error::Shape("group_norm_glu needs a standard-layout tensor".into()))?;
     let mut out_shape = shape.clone();
     out_shape[1] = c / 2;
-    let mut out = vec![0.0f32; b * half * groups * inner];
+    let mut out = uninit_vec(b * half * groups * inner);
 
     // One task per (row, group) pair, in the order `group_norm` walks them.
     out.par_chunks_mut(half * inner)
@@ -797,13 +797,49 @@ pub fn gemm_into_slice(
     }
 }
 
+/// Whether a buffer the following loop fills completely is zeroed first.
+///
+/// Zeroing one is a full extra pass over it, and the buffers here are the
+/// model's largest — the im2col patch matrix of the frequency branch's `k=3`
+/// convs is 134 MB a call. `DEMUCS_ZERO_OUTPUTS=1` restores the previous form
+/// for a same-binary A/B. `DEMUCS_UNINIT=0` is the older switch for the GEMM
+/// outputs ([`uninit_matrix`]) and forces zeros here too; it is *not* a fair
+/// comparison for this one, because the attention alone would then zero its
+/// 28.9 MB score matrix 80 times a segment.
+fn zero_outputs() -> bool {
+    static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| {
+        std::env::var("DEMUCS_ZERO_OUTPUTS").is_ok_and(|v| v != "0")
+            || std::env::var("DEMUCS_UNINIT").is_ok_and(|v| v == "0")
+    })
+}
+
+/// An array of the given shape whose elements are not initialised yet.
+///
+/// SAFETY: every element must be written before any is read — same contract as
+/// [`uninit_matrix`].
+pub fn uninit_array<Sh, D>(shape: Sh) -> ndarray::Array<f32, D>
+where
+    Sh: ndarray::IntoDimension<Dim = D>,
+    D: ndarray::Dimension,
+{
+    let dim = shape.into_dimension();
+    let len = dim.size();
+    if zero_outputs() {
+        return ndarray::Array::<f32, D>::zeros(dim);
+    }
+    let mut buffer = Vec::<f32>::with_capacity(len);
+    unsafe {
+        buffer.set_len(len);
+        ndarray::Array::from_shape_vec_unchecked(dim, buffer)
+    }
+}
+
 /// A `Vec` of `len` elements that are not initialised yet.
 ///
-/// SAFETY: the caller must write every element before reading any. The 1x1
-/// convolution's output is filled by the GEMM and the bias pass, so the zeroed
-/// version was paying for a full write of the same bytes.
+/// SAFETY: the caller must write every element before reading any.
 fn uninit_vec(len: usize) -> Vec<f32> {
-    if std::env::var("DEMUCS_UNINIT").is_ok_and(|v| v == "0") {
+    if zero_outputs() {
         return vec![0.0f32; len];
     }
     let mut buffer = Vec::<f32>::with_capacity(len);
@@ -1162,7 +1198,7 @@ pub fn transpose_owned_2d<S: ndarray::Data<Elem = f32> + Sync>(
     x: &ndarray::ArrayBase<S, ndarray::Ix2>,
 ) -> Array2<f32> {
     let (rows, cols) = x.dim();
-    let mut out = Array2::<f32>::zeros((cols, rows));
+    let mut out = uninit_array((cols, rows));
     let source = x.view();
     {
         let source = source.as_standard_layout();
