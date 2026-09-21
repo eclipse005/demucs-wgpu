@@ -2029,8 +2029,10 @@ impl GpuHtdemucsRunner {
             self.kernels
                 .add_in_place(gpu, arena, &mut recorder, &wave_spec, &time_out)?;
             let (staging, bytes) = stage_readback(gpu, &mut recorder, &wave_spec)?;
+            let (submission, timings) = recorder.submit_indexed(gpu);
             Ok(PendingStems {
-                submission: recorder.submit_indexed(gpu),
+                submission,
+                timings,
                 staging,
                 bytes,
                 shape: wave_spec.shape.clone(),
@@ -2651,6 +2653,9 @@ fn record_tensor(
 /// chunk's `Arena::reset` (safe only because both are ordered by the queue).
 pub struct PendingStems {
     submission: wgpu::SubmissionIndex,
+    /// `Some` only on a `DEMUCS_GPU_TIMINGS` run: the per-dispatch timestamps
+    /// this submission recorded, reported once it has been waited on.
+    timings: Option<crate::gpu::arena::PendingTimings>,
     staging: wgpu::Buffer,
     bytes: u64,
     shape: Vec<usize>,
@@ -2668,6 +2673,9 @@ impl PendingStems {
             runner
                 .gpu
                 .mapped_bytes_after(&self.staging, self.bytes, self.submission)?;
+        if let Some(timings) = self.timings {
+            timings.report(&runner.gpu)?;
+        }
         let values = array3_from_bytes(&data, &self.shape)?;
         values
             .into_shape_with_order((self.batch, self.sources, self.audio_channels, self.length))

@@ -1005,11 +1005,55 @@ impl Recorder {
     /// Deliberately no flush and no error scope: waiting here would give up the
     /// overlap this exists for, and anything the pass gets wrong surfaces at the
     /// next device poll — which is where the caller waits for this index.
-    pub fn submit_indexed(self, gpu: &Gpu) -> wgpu::SubmissionIndex {
+    ///
+    /// A recorder built with `DEMUCS_GPU_TIMINGS` also hands back its timing
+    /// state, resolve and copy already recorded into this submission. The caller
+    /// reports it after its wait — [`PendingTimings::report`] — because that is
+    /// the first moment the timestamps are safe to map, and waiting here for
+    /// them would defeat the point of submitting without a flush.
+    pub fn submit_indexed(
+        mut self,
+        gpu: &Gpu,
+    ) -> (wgpu::SubmissionIndex, Option<PendingTimings>) {
+        let dispatches = self.dispatches;
+        let mut pending = None;
+        if let Some(timing) = self.timing.take() {
+            let used = timing.next;
+            if used > 0 {
+                self.encoder
+                    .resolve_query_set(&timing.query_set, 0..used, &timing.resolve, 0);
+                self.encoder.copy_buffer_to_buffer(
+                    &timing.resolve,
+                    0,
+                    &timing.readback,
+                    0,
+                    (used as u64) * 8,
+                );
+                pending = Some(PendingTimings { timing, dispatches });
+            }
+        }
         gpu.flush_uniforms();
         let index = gpu.queue.submit([self.encoder.finish()]);
         gpu.reset_uniforms();
-        index
+        (index, pending)
+    }
+}
+
+/// A timed recorder's state for a submission that has not been waited on yet.
+///
+/// The resolve and the copy into the readback buffer ride the submission that
+/// [`Recorder::submit_indexed`] queued; the numbers are only readable once that
+/// submission has completed.
+pub struct PendingTimings {
+    timing: Timing,
+    dispatches: usize,
+}
+
+impl PendingTimings {
+    /// Maps the resolved timestamps and prints the per-kernel table and the
+    /// slowest individual dispatches for the chunk that produced them.
+    pub fn report(self, gpu: &Gpu) -> Result<()> {
+        self.timing.report(gpu, self.dispatches)
     }
 }
 
