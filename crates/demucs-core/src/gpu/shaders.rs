@@ -1854,7 +1854,16 @@ fn add_row_bias_in_place(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_i
 /// transposed conv spreads the full sample rate over `out_w`, which a packed
 /// pair would cap at 65535.
 pub fn col2im() -> String {
-    col2im_impl(None)
+    col2im_impl(None, false)
+}
+
+/// [`col2im`] with the convolution's bias added on the way out.
+///
+/// The gather writes every element exactly once, so the bias is an indexed load
+/// where the separate `add_row_bias_in_place` pass was a whole read-modify-write
+/// of the output.
+pub fn col2im_biased() -> String {
+    col2im_impl(None, true)
 }
 
 /// [`col2im`] with the kernel and stride baked in as constants.
@@ -1864,8 +1873,8 @@ pub fn col2im() -> String {
 /// integer divisions per element for the decoder's 4x4 stride-2 upsampling,
 /// which is where this kernel's time goes (0.97 ms a dispatch, three times what
 /// the forward gather costs). As constants those are masks and shifts.
-pub fn col2im_fixed(kernel: (usize, usize), stride: (usize, usize)) -> String {
-    col2im_impl(Some((kernel, stride)))
+pub fn col2im_fixed(kernel: (usize, usize), stride: (usize, usize), bias: bool) -> String {
+    col2im_impl(Some((kernel, stride)), bias)
 }
 
 /// Whether the transposed-conv gather bakes its kernel and stride in.
@@ -1876,7 +1885,7 @@ pub fn col2im_fixed_bake() -> bool {
         .unwrap_or(true)
 }
 
-fn col2im_impl(fixed: Option<((usize, usize), (usize, usize))>) -> String {
+fn col2im_impl(fixed: Option<((usize, usize), (usize, usize))>, bias: bool) -> String {
     let (consts, kh_src, kw_src, sh_src, sw_src) = match fixed {
         Some(((kh, kw), (sh, sw))) => (
             format!(
@@ -1896,6 +1905,14 @@ fn col2im_impl(fixed: Option<((usize, usize), (usize, usize))>) -> String {
             "ge.z",
         ),
     };
+    let (bias_decl, store) = if bias {
+        (
+            "@group(0) @binding(5) var<storage, read> Bias: array<f32>;",
+            "    Out[i] = acc + Bias[channel];",
+        )
+    } else {
+        ("", "    Out[i] = acc;")
+    };
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> P: array<f32>;
@@ -1903,6 +1920,7 @@ fn col2im_impl(fixed: Option<((usize, usize), (usize, usize))>) -> String {
 @group(0) @binding(2) var<uniform> gd: vec4<u32>;  // oc, kh, kw, out_h
 @group(0) @binding(3) var<uniform> ge: vec4<u32>;  // out_w, stride_h, stride_w, in_h
 @group(0) @binding(4) var<uniform> gf: vec4<u32>;  // in_w, batch, pitch, rows
+{bias_decl}
 {consts}
 const GRID_X: u32 = 65535u;
 
@@ -1952,9 +1970,11 @@ fn col2im(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
             acc = acc + P[(b * rows + channel * kh * kw + ky * kw + kx) * pitch + iy * in_w + ix];
         }}
     }}
-    Out[i] = acc;
+{store}
 }}
 "#,
+        bias_decl = bias_decl,
+        store = store,
         consts = consts,
         kh_src = kh_src,
         kw_src = kw_src,

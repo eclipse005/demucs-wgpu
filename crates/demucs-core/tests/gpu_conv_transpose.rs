@@ -15,7 +15,7 @@
 use demucs_core::fixtures::compare;
 use demucs_core::gpu::arena::{Arena, DevTensor, Recorder};
 use demucs_core::gpu::kernels::{pad_ceil, Col2ImShape, Kernels};
-use demucs_core::gpu::shaders::{BK, BM, BN};
+use demucs_core::gpu::shaders::{self, BK, BM, BN};
 use demucs_core::gpu::Gpu;
 
 fn gpu_or_skip() -> Option<Gpu> {
@@ -200,11 +200,14 @@ fn check(
             shape,
         )
         .unwrap();
-    let expected_dispatches = 1 + shape.batch * (1 + 1 + usize::from(with_bias));
+    // The bias rides the gather's own store when the fold is on, so the
+    // per-batch row-bias pass is gone in that case.
+    let bias_pass = usize::from(with_bias) * usize::from(!shaders::conv_bias_fuse());
+    let expected_dispatches = 1 + shape.batch * (1 + 1 + bias_pass);
     assert_eq!(
         recorder.dispatches(),
         expected_dispatches,
-        "one padded copy, then a GEMM, a gather and (with a bias) a row-bias pass per batch"
+        "one padded copy, then a GEMM and a gather per batch (the bias rides the gather)"
     );
     recorder.submit(gpu).unwrap();
 

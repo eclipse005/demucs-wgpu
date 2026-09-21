@@ -94,7 +94,7 @@ fn check(gpu: &Gpu, kernels: &Kernels, arena: &mut Arena, shape: Col2ImShape, la
 
     let mut recorder = Recorder::new(gpu);
     kernels
-        .col2im_into(gpu, arena, &mut recorder, &taps, &out, shape, pitch)
+        .col2im_into(gpu, arena, &mut recorder, &taps, &out, shape, pitch, None)
         .unwrap();
     assert_eq!(recorder.dispatches(), 1);
     recorder.submit(gpu).unwrap();

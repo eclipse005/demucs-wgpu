@@ -402,10 +402,12 @@ pub struct Kernels {
     /// ends with, in one pass instead of a scale, a copy and an add.
     channel_affine_act_add: wgpu::ComputePipeline,
     col2im: wgpu::ComputePipeline,
+    /// The same with the convolution's bias folded into the gather.
+    col2im_biased: wgpu::ComputePipeline,
     /// The transposed-conv gather with `(kh, kw, stride_h, stride_w)` compiled
     /// in, keyed by those values: built on first use, since the shape comes from
     /// the checkpoint rather than from the code.
-    col2im_fixed: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), wgpu::ComputePipeline>>,
+    col2im_fixed: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize, bool), wgpu::ComputePipeline>>,
     group_norm: wgpu::ComputePipeline,
     /// The split form of `group_norm`, for slices too big for one workgroup:
     /// a per-segment reduce, a per-pair stats fold, then apply.
@@ -677,6 +679,7 @@ impl Kernels {
                 "channel_affine_act_add",
             )?,
             col2im: gpu.pipeline("col2im", &shaders::col2im(), "col2im")?,
+            col2im_biased: gpu.pipeline("col2im_biased", &shaders::col2im_biased(), "col2im")?,
             col2im_fixed: std::cell::RefCell::new(std::collections::HashMap::new()),
             tanh: gpu.pipeline("tanh_activation", &shaders::tanh(), "tanh_activation")?,
             tanh_bias_in_place: gpu.pipeline(
@@ -2377,6 +2380,7 @@ impl Kernels {
         out: &DevTensor,
         shape: Col2ImShape,
         pitch: usize,
+        bias: Option<&DevTensor>,
     ) -> Result<()> {
         let (out_h, out_w) = shape.out_hw();
         let positions_in = shape.positions_in();
@@ -2436,19 +2440,20 @@ impl Kernels {
                 m_pad as u32,
             ],
         )?;
-        let pipeline = self.col2im_pipeline(gpu, shape.kernel, shape.stride)?;
-        let group = bind_group(
-            gpu,
-            "col2im",
-            &pipeline.get_bind_group_layout(0),
-            &[
-                (&taps.buffer, taps.offset, (taps.len() * 4) as u64),
-                (&out.buffer, out.offset, (out.len() * 4) as u64),
-                (&gd.buffer, gd.offset, 16),
-                (&ge.buffer, ge.offset, 16),
-                (&gf.buffer, gf.offset, 16),
-            ],
-        );
+        let fold_bias = bias.is_some() && shaders::conv_bias_fuse();
+        let pipeline =
+            self.col2im_pipeline(gpu, shape.kernel, shape.stride, fold_bias)?;
+        let mut bindings: Vec<(&wgpu::Buffer, u64, u64)> = vec![
+            (&taps.buffer, taps.offset, (taps.len() * 4) as u64),
+            (&out.buffer, out.offset, (out.len() * 4) as u64),
+            (&gd.buffer, gd.offset, 16),
+            (&ge.buffer, ge.offset, 16),
+            (&gf.buffer, gf.offset, 16),
+        ];
+        if let Some(bias) = bias.filter(|_| fold_bias) {
+            bindings.push((&bias.buffer, bias.offset, (bias.len() * 4) as u64));
+        }
+        let group = bind_group(gpu, "col2im", &pipeline.get_bind_group_layout(0), &bindings);
         let total = shape.batch * shape.out_channels * shape.positions_out();
         let (gx, gy) = row_grid(total.div_ceil(ROW_THREADS));
         recorder.dispatch("col2im", &pipeline, &group, (gx, gy, 1));
@@ -3385,17 +3390,22 @@ impl Kernels {
         gpu: &Gpu,
         kernel: (usize, usize),
         stride: (usize, usize),
+        bias: bool,
     ) -> Result<wgpu::ComputePipeline> {
         if !shaders::col2im_fixed_bake() || stride.0 == 0 || stride.1 == 0 {
-            return Ok(self.col2im.clone());
+            return Ok(if bias {
+                self.col2im_biased.clone()
+            } else {
+                self.col2im.clone()
+            });
         }
-        let key = (kernel.0, kernel.1, stride.0, stride.1);
+        let key = (kernel.0, kernel.1, stride.0, stride.1, bias);
         if let Some(compiled) = self.col2im_fixed.borrow().get(&key) {
             return Ok(compiled.clone());
         }
         let compiled = gpu.pipeline(
             "col2im_fixed",
-            &shaders::col2im_fixed(kernel, stride),
+            &shaders::col2im_fixed(kernel, stride, bias),
             "col2im",
         )?;
         self.col2im_fixed.borrow_mut().insert(key, compiled.clone());
@@ -4070,6 +4080,7 @@ impl Kernels {
                 &batch_taps,
                 job,
             )?;
+            let fold_bias = bias.is_some() && shaders::conv_bias_fuse();
             self.col2im_into(
                 gpu,
                 arena,
@@ -4081,11 +4092,14 @@ impl Kernels {
                     ..shape
                 },
                 pitch,
+                bias,
             )?;
-            // The bias belongs to the output channel, and the gather has already
-            // written every element, so this is the host's `bias + taps` in the
-            // other addition order rather than an initialisation.
-            if let Some(bias) = bias {
+            // The bias belongs to the output channel, and the gather writes
+            // every element once, so it rides the gather's own store — unless
+            // the shape keeps it out (see `Kernels::col2im_into`), in which case
+            // this is the host's `bias + taps` in the other addition order
+            // rather than an initialisation.
+            if let (Some(bias), false) = (bias, fold_bias) {
                 self.add_row_bias_in_place(
                     gpu,
                     arena,
