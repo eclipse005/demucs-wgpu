@@ -145,27 +145,32 @@ Numerical alignment against the Python reference (this port's acceptance gate �
 | Check | Result |
 |-------|--------|
 | Device vs Python, 1 s segment (vocals) | **124.15 dB** SNR |
-| Device vs Python, full 176.3 s track (vocals) | **128.79 dB** SNR / 121.36 dB SI-SDR |
+| Device vs Python, full 176.3 s track (vocals) | **129.13 dB** SNR |
+| Device vs Python, 20 s clip (vocals) | **125.78 dB** SNR |
 | Host (CPU) full track, vocals | 125.69 dB SNR |
 
 Speed (acceptance gate ② is to beat the CUDA reference; measured on a 10 GB NVIDIA P104-100, no
-fp16, serial):
+fp16, serial). The two 176.3 s rows were measured back to back on **the same input in the same
+session**, which is the only comparison this machine's drift (±4%, outliers to 20%) supports:
 
 | Path | Input | Wall clock | RTFx |
 |------|-------|-----------|------|
-| torch + CUDA (reference) | whole 176.3 s track | 6.75 s | **26.1x** (target to beat) |
-| torch + CUDA (reference) | 20 s clip | — | 26.2x (218 ms/chunk) |
-| **this port, wgpu / Vulkan (dGPU)** | 20 s clip | 1.29 s | **15.6x** (265 ms/chunk) |
-| this port, wgpu / Vulkan (Intel iGPU) | whole 176.3 s track | 72.1 s | 2.45x |
-| this port, CPU (host) | whole 176.3 s track | 48.7 s | 3.62x |
+| torch + CUDA (reference), same session | 176.3 s track | 8.86 s | **19.90x** |
+| **this port, wgpu / Vulkan (dGPU)** | 176.3 s track | 9.82 s | **17.96x** |
+| torch + CUDA (reference), published earlier on the original mix | 176.3 s track | 6.75 s | 26.13x |
+| this port, wgpu / Vulkan (dGPU) | 20 s clip | 1.28 s | 15.6x |
+| this port, wgpu / Vulkan (Intel iGPU) | 176.3 s track | 72.1 s | 2.45x |
+| this port, CPU (host) | 176.3 s track | 48.7 s | 3.62x |
 
-The device path's per-chunk cost is now 265 ms against the reference's 218 ms, i.e. **~1.2x off
-cuBLAS** rather than the 2.8x the previous revision of this table recorded: the steady-state chunk
-went 299 ms -> 265 ms over the last two commits (the softmax now writes only the per-row
-`(max, 1/Σexp)` and the AV product folds the exponential into its own `A` staging, so the
-`(heads·tokens, tokens)` probability matrix is never materialised). The host (CPU) path, by
-contrast, is complete and the default; the whole-track device figure is remeasured per commit and
-is not quoted here yet.
+On the paired run the device path is **1.11x behind the reference** (9.82 s against 8.86 s; 267 ms
+against 286 ms per chunk, and ~50 ms per chunk of that gap is host-side — stem readback and
+overlap-add — which never enters the GPU submit). Gate ② is still not met, but note that the
+26.13x line was set in an earlier session where the *same* reference code ran 31% faster than it
+does today (218 ms against 286 ms per chunk); the target is worth re-measuring before it is treated
+as the line to beat. The steady chunk has come down 299 ms -> 265 ms over the last two commits: the
+attention's softmax now writes only the per-row `(max, 1/Σexp)` and the `P·V` product folds the
+exponential into its own `A` staging, so the `(heads·tokens, tokens)` probability matrix is never
+materialised, and the norm kernels no longer walk their tensors strided.
 
 ## Project layout
 
