@@ -197,19 +197,19 @@ because the original mix that earlier rounds used is no longer on disk).
 | Input | Reference (CUDA) | This port (Vulkan) | Gap | SNR vs reference |
 |-------|------------------|--------------------|-----|------------------|
 | `clip20.wav` | 2.22 s / 8.99x | 1.06 s / **18.79x** | port 2.09x ahead | 125.34 dB |
-| `mix176.wav` | 7.70 s / **22.90x** | 7.64 s / **23.06x** | port 1.01x ahead | 127.17 dB |
+| `mix176.wav` | 7.55 s / **23.34x** | 7.35 s / **23.99x** | port 1.03x ahead | 127.17 dB |
 
-(Three alternating runs of each side in one session — reference 7.94/7.70/7.54 s, port
-7.62/7.66/7.64 s — so quote the pair rather than the digit: this machine drifts ±4%, and the
-reference's own spread is wider than the difference here. The 20 s row carries both sides' warm-up
-over a handful of chunks; the 176.3 s row is the one to compare, and there the two are level at 247 ms
-per chunk against the reference's 248 ms. Five paired changes got it here, in order: the chunk loop
-queues a segment and resolves the one before it (§11.14 of `GEMM_HANDOFF.md`), both block types'
-residuals ride their producer's epilogue (§11.15), a convolution's bias rides its GEMM's store, and
-the bias load moves out of the store loop on both sides of that (§11.16, §11.16.1). What is left is
-the device's own ~225 ms of kernel time per chunk — ~135 ms of it the GEMM family and another ~40 ms
-the im2col/col2im gathers, where cuBLAS reaches 5.0 TFLOP/s on these shapes on this card and the
-port's kernels 3.0-3.4.)
+(Three alternating runs of each side in one session — reference 7.55/7.55/7.51 s, port
+7.31/7.35/7.36 s — so quote the pair rather than the digit: this machine drifts ±4%. The 20 s row
+carries both sides' warm-up over a handful of chunks; the 176.3 s row is the one to compare, and
+there the port is **2.7% ahead** — 237 ms per chunk against the reference's 243 ms. Six paired changes
+got it here, in order: the chunk loop queues a segment and resolves the one before it (§11.14 of
+`GEMM_HANDOFF.md`), both block types' residuals ride their producer's epilogue (§11.15), a
+convolution's bias rides its GEMM's store and its load moves out of the store loop (§11.16), and the
+im2col gather walks eight columns per thread so its index decode is paid once (§11.16.2). What is left
+is the device's own ~216 ms of kernel time per chunk — ~135 ms of it the GEMM family and ~23 ms the
+gathers, where cuBLAS reaches 5.0 TFLOP/s on these shapes on this card and the port's kernels
+3.0-3.4.)
 
 
 ## Project layout

@@ -4143,7 +4143,15 @@ impl Kernels {
                 shape.pad.1 as u32,
             ],
         )?;
-        let gg = self.params(gpu, arena, [pitch as u32, rows as u32, 0, 0])?;
+        // The dispatch carries (position block, patch row of a batch, output row):
+        // no flat index, so the shader needs no division to find out where it is.
+        // `gg.z` carries the x grid in threads, which is the stride of the
+        // shader's own column loop; `DEMUCS_IM2COL_COLS` sets how many columns a
+        // thread covers.
+        let (out_h, out_w) = shape.out_hw();
+        let gx = out_w.div_ceil(ROW_THREADS * im2col_cols());
+        let gy = rows * shape.batch;
+        let gg = self.params(gpu, arena, [pitch as u32, rows as u32, (gx * ROW_THREADS) as u32, 0])?;
         let group = bind_group(
             gpu,
             "im2col",
@@ -4157,11 +4165,6 @@ impl Kernels {
                 (&gg.buffer, gg.offset, 16),
             ],
         );
-        // The dispatch carries (position block, patch row of a batch, output row):
-        // no flat index, so the shader needs no division to find out where it is.
-        let (out_h, out_w) = shape.out_hw();
-        let gx = out_w.div_ceil(ROW_THREADS);
-        let gy = rows * shape.batch;
         for (name, value) in [("x", gx), ("y", gy), ("z", out_h)] {
             if value > 65535 {
                 return Err(Error::Shape(format!(
@@ -4632,6 +4635,27 @@ fn row_grid(rows: usize) -> (u32, u32) {
 fn profile_convs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DEMUCS_PROFILE_CONVS").is_ok())
+}
+
+/// Columns one thread of the `im2col` gather walks.
+///
+/// The gather's index decode is uniform over its workgroup but six integer
+/// divisions deep, and every thread pays for its own copy — the shader's own
+/// history has it division-bound at 145 cycles an element. A thread that covers
+/// several columns pays the decode once and then only each column's address
+/// math; the warp's accesses stay coalesced because the lanes advance together.
+/// Eight is where the sweep flattens (one chunk's gathers: 31.8 ms at one column
+/// a thread, 25.1 at two, 23.1 at four, 22.7 at eight, 22.6 at sixteen), and
+/// `DEMUCS_IM2COL_COLS` moves it.
+fn im2col_cols() -> usize {
+    static COLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COLS.get_or_init(|| {
+        std::env::var("DEMUCS_IM2COL_COLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|c| *c >= 1)
+            .unwrap_or(8)
+    })
 }
 
 pub fn pad_ceil(value: usize, tile: usize) -> usize {

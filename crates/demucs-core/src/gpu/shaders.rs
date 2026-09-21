@@ -1771,7 +1771,7 @@ fn im2col(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     // arithmetic — and this is the widest kernel in the model (39 dispatches and
     // 224 ms per chunk before the change, on 151M elements for the first block).
     let ox = wid.x * THREADS + lid.x;
-    if (ox >= out_w || wid.z >= out_h) {{ return; }}
+    if (wid.z >= out_h) {{ return; }}
     let oy = wid.z;
     let flat = wid.y;
     let b = flat / rows;
@@ -1785,12 +1785,25 @@ fn im2col(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let kx = tap % kw;
 
     let iy = i32(oy * stride_h + ky) - i32(pad_h);
-    let ix = i32(ox * stride_w + kx) - i32(pad_w);
-    var value = 0.0;
-    if (iy >= 0 && iy < i32(h) && ix >= 0 && ix < i32(w)) {{
-        value = X[(b * in_channels + ic) * h * w + u32(iy) * w + u32(ix)];
+    let src = (b * in_channels + ic) * h * w + u32(iy) * w;
+    let dst = (b * rows + krow) * pitch + oy * out_w;
+    let row_ok = iy >= 0 && iy < i32(h);
+    // The decode above is uniform over the workgroup but costs every thread its
+    // own copy of six integer divisions, which is what the previous version of
+    // this kernel was bound on (145 cycles an element). Striding the columns
+    // inside the thread pays it once for `cols` elements: `gg.z` is the x grid
+    // in threads, so the loop's stride is the whole reduced x extent and the
+    // lanes of a warp still cover consecutive columns on every trip.
+    var col = ox;
+    while (col < out_w) {{
+        let ix = i32(col * stride_w + kx) - i32(pad_w);
+        var value = 0.0;
+        if (row_ok && ix >= 0 && ix < i32(w)) {{
+            value = X[src + u32(ix)];
+        }}
+        Out[dst + col] = value;
+        col += gg.z;
     }}
-    Out[(b * rows + krow) * pitch + oy * out_w + ox] = value;
 }}
 "#,
         threads = ROW_THREADS
