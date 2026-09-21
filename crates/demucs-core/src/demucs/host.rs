@@ -933,6 +933,26 @@ pub fn dconv_forward(branch: &DConvW, x: &Array3<f32>) -> Result<Array3<f32>> {
             group_norm(&y, 1, &layer.norm1_weight, &layer.norm1_bias)?
         };
         gelu_in_place(y.as_slice_mut().expect("standard layout"));
+        // The second half — `Conv1x1 -> GroupNorm(1) -> GLU -> LayerScale ->
+        // residual add` — has one fused form: the group norm's statistics are
+        // per row, the 1x1 already works one row at a time, and the intermediate
+        // is 66 MB a call. `DEMUCS_FUSE_DCONV_TAIL=0` runs the four operators
+        // separately, which is how the two were compared.
+        let fuse_tail = layer.conv2.kernel().len() == 1
+            && layer.conv2.kernel()[0] == 1
+            && std::env::var("DEMUCS_FUSE_DCONV_TAIL").map_or(true, |v| v != "0");
+        if fuse_tail {
+            let _scope = profile::scope("dconv.tail");
+            crate::demucs::ops::dconv_tail_into(
+                &mut out,
+                &y,
+                &layer.conv2,
+                &layer.norm2_weight,
+                &layer.norm2_bias,
+                &layer.gamma,
+            )?;
+            continue;
+        }
         y = {
             let _scope = profile::scope("dconv.conv2");
             conv1d(&y, &layer.conv2, 1, 0, 1)

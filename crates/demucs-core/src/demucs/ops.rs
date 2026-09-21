@@ -811,6 +811,137 @@ fn uninit_vec(len: usize) -> Vec<f32> {
     buffer
 }
 
+/// A pool of row scratch buffers for [`dconv_tail_into`].
+///
+/// One per job in flight rather than one per thread: the GEMM inside a row
+/// dispatches over the same rayon pool, so a worker can start another row task
+/// while its own is still running (a thread-local would be re-entered), and the
+/// buffers have to stay resident — a fresh 129 kB block per job is the page-fault
+/// cost the 1x1 branch just stopped paying.
+static ROW_SCRATCH: std::sync::Mutex<Vec<Vec<f32>>> = std::sync::Mutex::new(Vec::new());
+
+fn take_scratch(len: usize) -> Vec<f32> {
+    let mut pool = ROW_SCRATCH.lock().expect("row scratch pool");
+    match pool.pop() {
+        Some(buffer) if buffer.len() >= len => buffer,
+        Some(_) => uninit_vec(len),
+        None => uninit_vec(len),
+    }
+}
+
+fn give_scratch(buffer: Vec<f32>) {
+    let mut pool = ROW_SCRATCH.lock().expect("row scratch pool");
+    if pool.len() < 64 {
+        pool.push(buffer);
+    }
+}
+
+/// `out += gamma * GLU(group_norm(Conv1x1(y), 1))` — the DConv's second half in
+/// one pass over the data.
+///
+/// `group_norm` with `groups == 1` takes its statistics per leading index, and a
+/// 1x1 convolution already computes one leading index at a time, so the
+/// `(rows, 2c, plane)` intermediate never has to be materialised: each row lives
+/// in a per-worker scratch buffer that stays in cache, is normalised there, and
+/// is written out already gated, scaled and added to the residual.
+///
+/// The arithmetic is the one the separate operators perform, in the same order
+/// (`conv1d`'s GEMM and bias, `group_norm_glu`'s f64 statistics over the row in
+/// row-major order, its per-channel `scale`/`shift`, the GLU, the LayerScale
+/// multiply and the residual add), so the result is bit-identical to running
+/// them one after another.
+pub fn dconv_tail_into(
+    out: &mut Array3<f32>,
+    y: &Array3<f32>,
+    conv: &ConvW,
+    norm_weight: &[f32],
+    norm_bias: &[f32],
+    gamma: &[f32],
+) -> Result<()> {
+    let (rows, in_channels, plane) = y.dim();
+    let (out_rows, channels, out_plane) = out.dim();
+    let oc = conv.out_channels();
+    if out_rows != rows
+        || out_plane != plane
+        || channels * 2 != oc
+        || conv.in_channels() != in_channels
+        || norm_weight.len() != oc
+        || norm_bias.len() != oc
+        || gamma.len() != channels
+    {
+        return Err(Error::Shape(format!(
+            "dconv_tail_into: y ({rows}, {in_channels}, {plane}), out ({out_rows}, {channels}, \
+             {out_plane}), conv {}->{oc}, norm {}, gamma {}",
+            conv.in_channels(),
+            norm_weight.len(),
+            gamma.len()
+        )));
+    }
+    let source = y
+        .as_slice()
+        .ok_or_else(|| Error::Shape("dconv_tail_into needs a standard-layout input".into()))?;
+    let target = out
+        .as_slice_mut()
+        .ok_or_else(|| Error::Shape("dconv_tail_into needs a standard-layout output".into()))?;
+    let weight =
+        ArrayView2::from_shape((oc, in_channels), &conv.weight).expect("the weight is (oc, ic)");
+    let half = channels;
+    let row_len = oc * plane;
+
+    target
+        .par_chunks_mut(half * plane)
+        .enumerate()
+        .for_each(|(row, dst)| {
+            let mut scratch = take_scratch(row_len);
+            {
+                let scratch = &mut scratch[..row_len];
+                let patch = ArrayView2::from_shape(
+                    (in_channels, plane),
+                    &source[row * in_channels * plane..(row + 1) * in_channels * plane],
+                )
+                .expect("one row of the input");
+                gemm_into_slice(scratch, &weight, &patch);
+                for (channel_row, shift) in scratch.chunks_mut(plane).zip(conv.bias.iter()) {
+                    if *shift != 0.0 {
+                        for value in channel_row.iter_mut() {
+                            *value += *shift;
+                        }
+                    }
+                }
+                // `group_norm_glu` with one group: the statistics are this row's.
+                let count = row_len as f64;
+                let mut sum = 0.0f64;
+                let mut sum_sq = 0.0f64;
+                for value in scratch.iter() {
+                    let v = *value as f64;
+                    sum += v;
+                    sum_sq += v * v;
+                }
+                let mean = sum / count;
+                let variance = (sum_sq / count - mean * mean).max(0.0);
+                let inv = 1.0 / ((variance + 1e-5).sqrt() as f32);
+                let mean = mean as f32;
+                let scale = |channel: usize| inv * norm_weight[channel];
+                let shift = |channel: usize| norm_bias[channel] - mean * scale(channel);
+                for k in 0..half {
+                    let (value_scale, value_shift) = (scale(k), shift(k));
+                    let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));
+                    let values = &scratch[k * plane..(k + 1) * plane];
+                    let gates = &scratch[(k + half) * plane..(k + half + 1) * plane];
+                    let run = &mut dst[k * plane..(k + 1) * plane];
+                    let layer_scale = gamma[k];
+                    for i in 0..plane {
+                        let value = values[i] * value_scale + value_shift;
+                        let gate = gates[i] * gate_scale + gate_shift;
+                        run[i] += layer_scale * (value * (1.0 / (1.0 + (-gate).exp())));
+                    }
+                }
+            }
+            give_scratch(scratch);
+        });
+    Ok(())
+}
+
 /// Which GEMM implementation to use. `ndarray` is kept so the switch can be
 /// A/B'd with one environment variable on the same binary.
 pub fn use_ndarray_gemm() -> bool {
