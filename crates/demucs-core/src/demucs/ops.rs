@@ -962,6 +962,12 @@ pub fn dconv_tail_into(
                     &source[row * in_channels * plane..(row + 1) * in_channels * plane],
                 )
                 .expect("one row of the input");
+                // The row loop does *not* saturate the pool on its own, so each
+                // row's GEMM keeps the crate's own dispatch. Serialising it
+                // (`Parallelism::None`) halves the GEMM's own CPU time — 180.2
+                // to 92.8 ms summed across the segment — and still makes the
+                // tail *slower*: 151.2 to 167.0 ms, and the segment 991.4 to
+                // 1003.6. Measured, reverted.
                 gemm_into_slice(scratch, &weight, &patch);
                 for (channel_row, shift) in scratch.chunks_mut(plane).zip(conv.bias.iter()) {
                     if *shift != 0.0 {
@@ -990,7 +996,10 @@ pub fn dconv_tail_into(
                 // branch's single-row DConv 48 tasks) measured *slower* as
                 // well — 1007.6-1009.1 ms a segment against 975 for four
                 // interleaved serial runs — so the exponential in it is not
-                // what that branch's stage time is made of either.
+                // what that branch's stage time is made of either. Summed
+                // across a segment the write is the tail's largest single item
+                // (202.3 ms of 459.1 for the three parts, against 173.0 for the
+                // GEMM and 83.8 for the statistics).
                 for k in 0..half {
                     let (value_scale, value_shift) = (scale(k), shift(k));
                     let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));
