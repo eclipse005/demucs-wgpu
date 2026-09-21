@@ -560,11 +560,14 @@ fn profile(args: ProfileArgs) -> Result<()> {
     println!("one segment: {:.1} ms wall per forward", wall * 1000.0);
     println!("{:<28} {:>10} {:>9} {:>9}", "stage", "total ms", "per call", "calls");
     for (name, seconds, count) in entries {
+        // `total` is per forward, `calls` is per forward too, so `per call` is
+        // the quotient of the two printed numbers — dividing by the raw `count`
+        // (which covers every repeat) was off by `repeats`.
         println!(
             "{:<28} {:>10.1} {:>9.2} {:>9}",
             name,
             seconds * 1000.0 / args.repeats as f64,
-            seconds * 1000.0 / args.repeats as f64 / count as f64,
+            seconds * 1000.0 / count as f64,
             count / args.repeats
         );
     }

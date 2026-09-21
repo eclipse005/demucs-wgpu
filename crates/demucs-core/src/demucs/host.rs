@@ -30,17 +30,20 @@ use crate::error::{Error, Result};
 /// the source. Enabled from the environment so a normal run pays one relaxed
 /// atomic load per stage and nothing else.
 pub mod profile {
-    use std::cell::RefCell;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
 
-    #[derive(Default)]
-    struct Totals {
-        entries: Vec<(String, f64, usize)>,
-    }
-
-    thread_local! {
-        static TOTALS: RefCell<Totals> = RefCell::new(Totals::default());
+    /// One table for every thread.
+    ///
+    /// It used to be thread-local, which silently dropped the stages that run
+    /// inside a rayon region: `attention_head`'s own split into QK, softmax and
+    /// the AV product is entirely on worker threads, so those rows never
+    /// appeared in the report and the whole 220 ms stage was unattributable.
+    /// The lock costs nothing while profiling is off (the scopes never touch the
+    /// table) and is noise next to the stages being measured while it is on.
+    fn totals() -> &'static Mutex<Vec<(String, f64, usize)>> {
+        static TOTALS: OnceLock<Mutex<Vec<(String, f64, usize)>>> = OnceLock::new();
+        TOTALS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     pub fn enabled() -> bool {
@@ -48,7 +51,7 @@ pub mod profile {
         *ON.get_or_init(|| std::env::var("DEMUCS_PROFILE").is_ok_and(|v| v != "0"))
     }
 
-    /// Accumulates into the thread-local table while it is alive.
+    /// Accumulates into the shared table while it is alive.
     pub struct Scope {
         name: &'static str,
         index: Option<usize>,
@@ -63,16 +66,15 @@ pub mod profile {
                     Some(index) => format!("{}.{}", self.name, index),
                     None => self.name.to_string(),
                 };
-                TOTALS.with(|totals| {
-                    let mut totals = totals.borrow_mut();
-                    match totals.entries.iter_mut().find(|(name, _, _)| *name == key) {
+                if let Ok(mut totals) = totals().lock() {
+                    match totals.iter_mut().find(|(name, _, _)| *name == key) {
                         Some(entry) => {
                             entry.1 += seconds;
                             entry.2 += 1;
                         }
-                        None => totals.entries.push((key, seconds, 1)),
+                        None => totals.push((key, seconds, 1)),
                     }
-                });
+                }
             }
         }
     }
@@ -96,16 +98,18 @@ pub mod profile {
 
     /// The accumulated table, sorted by total time, and reset.
     pub fn take() -> Vec<(String, f64, usize)> {
-        TOTALS.with(|totals| {
-            let mut totals = totals.borrow_mut();
-            let mut entries = std::mem::take(&mut totals.entries);
-            entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            entries
-        })
+        let mut entries = match totals().lock() {
+            Ok(mut totals) => std::mem::take(&mut *totals),
+            Err(_) => Vec::new(),
+        };
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        entries
     }
 
     pub fn reset() {
-        TOTALS.with(|totals| totals.borrow_mut().entries.clear());
+        if let Ok(mut totals) = totals().lock() {
+            totals.clear();
+        }
     }
 }
 
@@ -1085,15 +1089,78 @@ pub fn one_dimensional_positions(length: usize, dim: usize, max_period: f32) -> 
     out
 }
 
-/// `MyGroupNorm(1, dim)` applied to a `(b, t, c)` tensor.
-fn group_norm_positions(x: &Array3<f32>, norm: &GroupNormW) -> Result<Array3<f32>> {
-    let transposed = x
-        .view()
-        .permuted_axes([0, 2, 1])
-        .as_standard_layout()
-        .to_owned();
-    let out = group_norm(&transposed, norm.groups, &norm.weight, &norm.bias)?;
-    Ok(out.permuted_axes([0, 2, 1]).as_standard_layout().to_owned())
+/// `MyGroupNorm(1, dim)` applied to a `(b, t, c)` tensor, in place.
+///
+/// The reference normalises the *transposed* tensor — `x.permute(0, 2, 1)` —
+/// with a single group, so the statistics cover every element of every batch in
+/// either layout and only the accumulation order changes. Computing them here
+/// instead of after a transpose drops both transposed copies: with the round
+/// trip this stage was 54.8 ms of a 982 ms segment (the ten transformer layers;
+/// ~2 GB/s effective) for three sweeps over a 5.5 MB tensor and two
+/// cache-hostile transposes.
+///
+/// `groups > 1` does split along the channel axis, which is the last one here,
+/// so that case keeps the transposing path. 32 K element blocks combined in
+/// order keep the f64 reduction from depending on how it was scheduled.
+fn group_norm_positions(mut x: Array3<f32>, norm: &GroupNormW) -> Result<Array3<f32>> {
+    if norm.groups != 1 || std::env::var("DEMUCS_GN_TRANSPOSE").is_ok_and(|v| v == "1") {
+        let transposed = x
+            .view()
+            .permuted_axes([0, 2, 1])
+            .as_standard_layout()
+            .to_owned();
+        let out = group_norm(&transposed, norm.groups, &norm.weight, &norm.bias)?;
+        return Ok(out.permuted_axes([0, 2, 1]).as_standard_layout().to_owned());
+    }
+    let (_b, t, c) = x.dim();
+    if norm.weight.len() != c || norm.bias.len() != c {
+        return Err(Error::Shape(format!(
+            "group_norm_positions: {c} channels, {} affine entries",
+            norm.weight.len()
+        )));
+    }
+    let plane = t * c;
+    let flat = x
+        .as_slice_mut()
+        .ok_or_else(|| Error::Shape("group_norm_positions needs a standard-layout tensor".into()))?;
+    flat.par_chunks_mut(plane).for_each(|batch| {
+        let count = batch.len() as f64;
+        let partials: Vec<(f64, f64)> = batch
+            .par_chunks(32768)
+            .map(|block| {
+                let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+                for value in block {
+                    let v = *value as f64;
+                    sum += v;
+                    sum_sq += v * v;
+                }
+                (sum, sum_sq)
+            })
+            .collect();
+        let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+        for (block_sum, block_sq) in partials {
+            sum += block_sum;
+            sum_sq += block_sq;
+        }
+        let mean = sum / count;
+        let variance = (sum_sq / count - mean * mean).max(0.0);
+        let inv = 1.0 / ((variance + 1e-5).sqrt() as f32);
+        let mean = mean as f32;
+        // Same expressions as `group_norm`'s affine, so the rounding matches.
+        let scale: Vec<f32> = norm.weight.iter().map(|weight| inv * weight).collect();
+        let shift: Vec<f32> = norm
+            .bias
+            .iter()
+            .zip(scale.iter())
+            .map(|(bias, scale)| bias - mean * scale)
+            .collect();
+        for row in batch.chunks_mut(c) {
+            for (value, (gain, offset)) in row.iter_mut().zip(scale.iter().zip(shift.iter())) {
+                *value = *value * gain + offset;
+            }
+        }
+    });
+    Ok(x)
 }
 
 /// `nn.MultiheadAttention` on `(b, n, c)` tensors with `batch_first=True`.
@@ -1128,12 +1195,15 @@ fn multi_head_attention(
     // (batch, n, heads, d_head)-logical layout directly: the extra permute pass
     // would add a full read and write of every projection.
     let mut qkv: Vec<Array2<f32>> = Vec::with_capacity(3);
-    for (weight, bias, input, n) in [
-        (&layer.q_weight, &layer.q_bias, query, n_q),
-        (&layer.k_weight, &layer.k_bias, key, n_k),
-        (&layer.v_weight, &layer.v_bias, value, n_k),
-    ] {
-        qkv.push(project(weight, bias, input, n)?);
+    {
+        let _s = profile::scope("transformer.attn.qkv");
+        for (weight, bias, input, n) in [
+            (&layer.q_weight, &layer.q_bias, query, n_q),
+            (&layer.k_weight, &layer.k_bias, key, n_k),
+            (&layer.v_weight, &layer.v_bias, value, n_k),
+        ] {
+            qkv.push(project(weight, bias, input, n)?);
+        }
     }
     if let Some(nm) = name {
         if trace.wants(&format!("{nm}.attn.q")) {
@@ -1217,7 +1287,10 @@ fn classic_layer_forward(
     name: &str,
     trace: &mut dyn TraceSink,
 ) -> Result<Array3<f32>> {
-    let normed = normalise_rows(x, &layer.norm1)?;
+    let normed = {
+        let _s = profile::scope("transformer.norm1");
+        normalise_rows(x, &layer.norm1)?
+    };
     if trace.wants(&format!("{name}.norm1")) {
         trace.record(&format!("{name}.norm1"), normed.view().into_dyn());
     }
@@ -1228,16 +1301,28 @@ fn classic_layer_forward(
     if trace.wants(&format!("{name}.self_attn")) {
         trace.record(&format!("{name}.self_attn#0"), attended.view().into_dyn());
     }
-    let mut out = x + &scaled_channels(&attended, &layer.gamma1);
+    let mut out = {
+        let _s = profile::scope("transformer.resid1");
+        x + &scaled_channels(&attended, &layer.gamma1)
+    };
 
-    let normed = normalise_rows(&out, &layer.norm2)?;
+    let normed = {
+        let _s = profile::scope("transformer.norm2");
+        normalise_rows(&out, &layer.norm2)?
+    };
     if trace.wants(&format!("{name}.norm2")) {
         trace.record(&format!("{name}.norm2"), normed.view().into_dyn());
     }
     let fed = feed_forward(layer, &normed, name, trace)?;
-    out = &out + &scaled_channels(&fed, &layer.gamma2);
+    out = {
+        let _s = profile::scope("transformer.resid2");
+        &out + &scaled_channels(&fed, &layer.gamma2)
+    };
 
-    let out = group_norm_positions(&out, &layer.norm_out)?;
+    let out = {
+        let _s = profile::scope("transformer.norm_out");
+        group_norm_positions(out, &layer.norm_out)?
+    };
     if trace.wants(&format!("{name}.norm_out")) {
         trace.record(&format!("{name}.norm_out"), out.view().into_dyn());
     }
@@ -1256,8 +1341,14 @@ fn cross_layer_forward(
     name: &str,
     trace: &mut dyn TraceSink,
 ) -> Result<Array3<f32>> {
-    let normed_q = normalise_rows(q, &layer.norm1)?;
-    let normed_k = normalise_rows(k, &layer.norm2)?;
+    let normed_q = {
+        let _s = profile::scope("transformer.norm1");
+        normalise_rows(q, &layer.norm1)?
+    };
+    let normed_k = {
+        let _s = profile::scope("transformer.norm2");
+        normalise_rows(k, &layer.norm2)?
+    };
     if trace.wants(&format!("{name}.norm1")) {
         trace.record(&format!("{name}.norm1"), normed_q.view().into_dyn());
     }
@@ -1271,19 +1362,31 @@ fn cross_layer_forward(
     if trace.wants(&format!("{name}.cross_attn")) {
         trace.record(&format!("{name}.cross_attn#0"), attended.view().into_dyn());
     }
-    let mut out = q + &scaled_channels(&attended, &layer.gamma1);
+    let mut out = {
+        let _s = profile::scope("transformer.resid1");
+        q + &scaled_channels(&attended, &layer.gamma1)
+    };
 
     let norm3 = layer.norm3.as_ref().ok_or_else(|| {
         Error::Shape(format!("{name}: a cross layer must carry norm3"))
     })?;
-    let normed = normalise_rows(&out, norm3)?;
+    let normed = {
+        let _s = profile::scope("transformer.norm3");
+        normalise_rows(&out, norm3)?
+    };
     if trace.wants(&format!("{name}.norm3")) {
         trace.record(&format!("{name}.norm3"), normed.view().into_dyn());
     }
     let fed = feed_forward(layer, &normed, name, trace)?;
-    out = &out + &scaled_channels(&fed, &layer.gamma2);
+    out = {
+        let _s = profile::scope("transformer.resid2");
+        &out + &scaled_channels(&fed, &layer.gamma2)
+    };
 
-    let out = group_norm_positions(&out, &layer.norm_out)?;
+    let out = {
+        let _s = profile::scope("transformer.norm_out");
+        group_norm_positions(out, &layer.norm_out)?
+    };
     if trace.wants(&format!("{name}.norm_out")) {
         trace.record(&format!("{name}.norm_out"), out.view().into_dyn());
     }
@@ -1307,7 +1410,10 @@ fn feed_forward(
     if trace.wants(&format!("{name}.linear1")) {
         trace.record(&format!("{name}.linear1"), hidden.view().into_dyn());
     }
-    gelu_in_place(hidden.as_slice_mut().expect("standard layout"));
+    {
+        let _s = profile::scope("transformer.ffn.gelu");
+        gelu_in_place(hidden.as_slice_mut().expect("standard layout"));
+    }
     let out = {
         let _scope = profile::scope("transformer.ffn");
         linear_3d(&layer.linear2, &hidden)

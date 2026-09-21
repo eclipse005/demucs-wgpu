@@ -1295,14 +1295,21 @@ pub fn attention_head(
     // most of its parallelism: 265.8 and 253.3 ms for the stage). Reverted.
     let (n_q, _d_head) = q.dim();
     let n_k = k.dim().0;
-    let scaled = scaled_rows(q, scale);
-    let mut scores = matmul_bt(&scaled, k);
+    let mut scores = {
+        let _s = crate::demucs::host::profile::scope("transformer.attn.qk");
+        let scaled = scaled_rows(q, scale);
+        matmul_bt(&scaled, k)
+    };
     // Normalise on the way out (`softmax_exp_rows`) unless a tracer wants the
     // probabilities themselves, which `scores_out` asks for.
     let defer = scores_out.is_none()
         && std::env::var("DEMUCS_SOFTMAX_DEFER").map_or(true, |v| v != "0");
     if defer {
-        let sums = softmax_exp_rows(&mut scores);
+        let sums = {
+            let _s = crate::demucs::host::profile::scope("transformer.attn.soft");
+            softmax_exp_rows(&mut scores)
+        };
+        let _av = crate::demucs::host::profile::scope("transformer.attn.av");
         let mut out = matmul(&scores, v);
         out.axis_iter_mut(Axis(0))
             .into_par_iter()
