@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use ndarray::{Array2, Array3, ArrayView3};
+use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
@@ -234,36 +235,50 @@ impl Stft {
         let mut scratch = vec![Complex32::default(); self.inverse.get_inplace_scratch_len()];
         let mut buffer = vec![Complex32::default(); n_fft];
 
-        // Frame contributions overlap, so accumulate serially per batch row.
+        // Frame contributions overlap, so accumulate serially *within* a row —
+        // but the rows have nothing to do with each other, and there are
+        // `batch * sources * channels` of them (eight for the waveform branch's
+        // epilogue). One task per row, each with its own FFT scratch, the way
+        // the forward transform already does it; the per-row accumulation order
+        // is untouched, so this is bit-identical to the serial loop.
         let mut result = Array2::<f32>::zeros((batch, out_len));
-        for b in 0..batch {
-            let mut y = vec![0.0f32; expected];
-            let mut envelope = vec![0.0f32; expected];
-            for f in 0..frames {
-                // Rebuild the full Hermitian spectrum from the one-sided half.
-                buffer[0] = spec[[b, 0, f]];
-                for k in 1..bins {
-                    let value = spec[[b, k, f]];
-                    buffer[k] = value;
-                    buffer[n_fft - k] = value.conj();
+        let rows: Vec<&mut [f32]> = result
+            .axis_iter_mut(ndarray::Axis(0))
+            .map(|row| row.into_slice().expect("contiguous row"))
+            .collect();
+        rows.into_par_iter()
+            .enumerate()
+            .for_each(|(b, row_out)| {
+                let mut scratch =
+                    vec![Complex32::default(); self.inverse.get_inplace_scratch_len()];
+                let mut buffer = vec![Complex32::default(); n_fft];
+                let mut y = vec![0.0f32; expected];
+                let mut envelope = vec![0.0f32; expected];
+                for f in 0..frames {
+                    // Rebuild the full Hermitian spectrum from the one-sided half.
+                    buffer[0] = spec[[b, 0, f]];
+                    for k in 1..bins {
+                        let value = spec[[b, k, f]];
+                        buffer[k] = value;
+                        buffer[n_fft - k] = value.conj();
+                    }
+
+                    self.inverse.process_with_scratch(&mut buffer, &mut scratch);
+
+                    let offset = f * hop;
+                    let inv_n = norm_scale / n_fft as f32;
+                    for i in 0..n_fft {
+                        let w = self.window[i];
+                        y[offset + i] += buffer[i].re * inv_n * w;
+                        envelope[offset + i] += w * w;
+                    }
                 }
 
-                self.inverse.process_with_scratch(&mut buffer, &mut scratch);
-
-                let offset = f * hop;
-                let inv_n = norm_scale / n_fft as f32;
-                for i in 0..n_fft {
-                    let w = self.window[i];
-                    y[offset + i] += buffer[i].re * inv_n * w;
-                    envelope[offset + i] += w * w;
+                for i in start..end {
+                    let denom = envelope[i];
+                    row_out[i - start] = if denom != 0.0 { y[i] / denom } else { 0.0 };
                 }
-            }
-
-            for i in start..end {
-                let denom = envelope[i];
-                result[[b, i - start]] = if denom != 0.0 { y[i] / denom } else { 0.0 };
-            }
-        }
+            });
         Ok(result)
     }
 }
