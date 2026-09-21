@@ -1920,13 +1920,18 @@ impl GpuHtdemucsRunner {
     }
 
     /// Mix in, stems out, one submit: STFT, both stacks, iSTFT.
+    ///
+    /// Returns once the chunk is *queued*, not once it has run: the wait lives
+    /// in [`PendingStems::collect`], which a chunk loop can call one segment
+    /// behind — with the next segment already submitted, its readback costs
+    /// host time the device is not waiting on.
     fn forward_stems(
         &self,
         mix: &Array3<f32>,
         sources: usize,
         length: usize,
         trace: &mut dyn TraceSink,
-    ) -> Result<Array4<f32>> {
+    ) -> Result<PendingStems> {
         let gpu = &self.gpu;
         let hop = self.config.hop_length();
         let nfft = self.config.nfft;
@@ -2024,11 +2029,16 @@ impl GpuHtdemucsRunner {
             self.kernels
                 .add_in_place(gpu, arena, &mut recorder, &wave_spec, &time_out)?;
             let (staging, bytes) = stage_readback(gpu, &mut recorder, &wave_spec)?;
-            recorder.submit(gpu)?;
-            let values = array3_from_bytes(&gpu.mapped_bytes(&staging, bytes)?, &wave_spec.shape)?;
-            values
-                .into_shape_with_order((batch, sources, audio_channels, length))
-                .map_err(|e| Error::Shape(format!("stems reshape: {e}")))
+            Ok(PendingStems {
+                submission: recorder.submit_indexed(gpu),
+                staging,
+                bytes,
+                shape: wave_spec.shape.clone(),
+                batch,
+                sources,
+                audio_channels,
+                length,
+            })
         }
     }
 
@@ -2631,9 +2641,45 @@ fn record_tensor(
     Ok(())
 }
 
+/// One chunk's stems, submitted but not read back yet.
+///
+/// The submission index is the whole point: it lets the caller wait for *this*
+/// chunk instead of for the queue, so a chunk loop can have segment n+1 running
+/// while segment n's readback is mapped on the host. Nothing here may be reused
+/// until [`PendingStems::collect`] returns — the staging buffer is written by
+/// the copy, and the arena region the copy reads from is handed back to the next
+/// chunk's `Arena::reset` (safe only because both are ordered by the queue).
+pub struct PendingStems {
+    submission: wgpu::SubmissionIndex,
+    staging: wgpu::Buffer,
+    bytes: u64,
+    shape: Vec<usize>,
+    batch: usize,
+    sources: usize,
+    audio_channels: usize,
+    length: usize,
+}
+
+impl PendingStems {
+    /// Waits for this chunk's submission — and only this one — then maps the
+    /// stems out of its staging buffer.
+    pub fn collect(self, runner: &GpuHtdemucsRunner) -> Result<Array4<f32>> {
+        let data =
+            runner
+                .gpu
+                .mapped_bytes_after(&self.staging, self.bytes, self.submission)?;
+        let values = array3_from_bytes(&data, &self.shape)?;
+        values
+            .into_shape_with_order((self.batch, self.sources, self.audio_channels, self.length))
+            .map_err(|e| Error::Shape(format!("stems reshape: {e}")))
+    }
+}
+
 /// Records a readback of `tensor` into a fresh staging buffer on the recorder's
 /// own encoder, so the copy rides the same submission as the dispatches that
-/// produced it. The caller submits and then maps with [`Gpu::mapped_bytes`].
+/// produced it. The caller submits and then maps with
+/// [`Gpu::mapped_bytes_after`] — or hands the pair to [`PendingStems`] and lets
+/// its `collect` do the waiting.
 fn stage_readback(
     gpu: &Gpu,
     recorder: &mut Recorder,
@@ -2659,8 +2705,47 @@ fn array3_from_bytes(data: &[u8], shape: &[usize]) -> Result<Array3<f32>> {
         .map_err(|e| Error::Shape(format!("readback: {e}")))
 }
 
+/// The chunk loop's handle on the device: [`SegmentForward`] with the wait left
+/// to the caller's next iteration.
+///
+/// `start` queues a chunk and hands back its [`PendingStems`]; `collect` — called
+/// one group later by `split_pass` — waits for that submission and maps it. The
+/// arena the chunk was recorded against is reset by the *next* `start`; that is
+/// safe only because the queue runs the next chunk after this one's staging copy
+/// has read it, the same submission ordering the uniform pack relies on.
+///
+/// [`SegmentForward`]: crate::demucs::pipeline::SegmentForward
+pub struct DeviceForward<'a> {
+    host: &'a crate::demucs::host::Htdemucs,
+    runner: &'a GpuHtdemucsRunner,
+}
+
+impl<'a> DeviceForward<'a> {
+    pub fn new(host: &'a crate::demucs::host::Htdemucs, runner: &'a GpuHtdemucsRunner) -> Self {
+        Self { host, runner }
+    }
+}
+
+impl crate::demucs::pipeline::SegmentForward for DeviceForward<'_> {
+    type Pending = PendingStems;
+
+    fn start(&self, padded: &Array3<f32>, trace: &mut dyn TraceSink) -> Result<PendingStems> {
+        let sources = self.host.config.sources.len();
+        let length = self.host.training_length();
+        self.runner.forward_stems(padded, sources, length, trace)
+    }
+
+    fn collect(&self, pending: PendingStems, _trace: &mut dyn TraceSink) -> Result<Array4<f32>> {
+        pending.collect(self.runner)
+    }
+}
+
 /// The full separation path on device: STFT, both stacks, iSTFT, one submit.
 /// The host only reflect-pads the mix and maps the waveform readback.
+///
+/// This is the *synchronous* entry — submit, then wait for it. The chunk loop
+/// goes through [`DeviceForward`] instead, which queues a chunk and collects it
+/// one group later.
 ///
 /// `mix` may stack several same-shaped chunks on its batch axis — the split
 /// path pads every chunk to the segment length, so that is the natural shape
@@ -2682,7 +2767,9 @@ pub fn separate_gpu(
     if stage_timing {
         eprintln!("[stg] front end {:?}", front.elapsed());
     }
-    let stems = runner.forward_stems(mix, sources, training_length, trace)?;
+    let stems = runner
+        .forward_stems(mix, sources, training_length, trace)?
+        .collect(runner)?;
     if stage_timing {
         eprintln!("[stg] device+readback {:?}", model.elapsed());
         let (labels, ms, ops) = crate::gpu::arena::host_timing_take();

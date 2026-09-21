@@ -466,13 +466,44 @@ impl Gpu {
     /// Maps a staging buffer filled by an earlier `copy_to_staging` and copies
     /// it out. Requires the submission that recorded the copy to have completed.
     pub fn mapped_bytes(&self, staging: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>> {
+        self.map_staging(staging, bytes, wgpu::PollType::wait_indefinitely())
+    }
+
+    /// [`Gpu::mapped_bytes`] for a copy whose submission the caller knows: waits
+    /// for that submission and nothing later.
+    ///
+    /// That is the difference between a chunk loop that pays for its readback
+    /// *after* the device drains the queue and one that pays for it while the
+    /// next chunk — already submitted — runs.
+    pub fn mapped_bytes_after(
+        &self,
+        staging: &wgpu::Buffer,
+        bytes: u64,
+        submission: wgpu::SubmissionIndex,
+    ) -> Result<Vec<u8>> {
+        self.map_staging(
+            staging,
+            bytes,
+            wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            },
+        )
+    }
+
+    fn map_staging(
+        &self,
+        staging: &wgpu::Buffer,
+        bytes: u64,
+        wait: wgpu::PollType,
+    ) -> Result<Vec<u8>> {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wait)
             .map_err(|e| Error::Gpu(format!("poll for readback: {e}")))?;
         rx.recv()
             .map_err(|_| Error::Gpu("map callback dropped".into()))?

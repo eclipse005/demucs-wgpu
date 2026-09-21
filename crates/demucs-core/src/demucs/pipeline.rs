@@ -187,8 +187,61 @@ pub fn separate(
     separate_with(model, &|padded, trace| model.forward(padded, trace), mix, options, trace)
 }
 
-/// [separate] with an injected per-chunk forward — the device path passes
-/// the wgpu runner's separate_gpu here.
+/// One group of segments' forward, split into "queue it" and "wait for it".
+///
+/// The device path needs both halves: a chunk can stay in flight while the loop
+/// prepares and submits the next one, which is what keeps the readback off the
+/// critical path. The host path implements the pair as compute-then-hand-back,
+/// so its arithmetic and the order it runs in are unchanged.
+///
+/// [`SegmentForward::start`] hands back the queued group's handle and the caller
+/// — which is the only thing that knows when it wants the result — passes it to
+/// [`SegmentForward::collect`]. Keeping the handle in the loop's state rather
+/// than inside the forward is what lets a group be in flight across the next
+/// group's submit.
+pub trait SegmentForward {
+    /// What one queued group hands to its `collect`: the device path's submitted
+    /// chunk, the host path's finished tensor.
+    type Pending;
+
+    /// Queues one forward of `padded`, a `(group * mix_batch, channels,
+    /// segment_length)` tensor, and returns with the work in flight.
+    fn start(&self, padded: &Array3<f32>, trace: &mut dyn TraceSink) -> Result<Self::Pending>;
+
+    /// Waits for the group queued by the matching [`SegmentForward::start`] and
+    /// returns its output.
+    fn collect(&self, pending: Self::Pending, trace: &mut dyn TraceSink) -> Result<Array4<f32>>;
+}
+
+/// A [`SegmentForward`] over a plain closure: the whole forward happens inside
+/// `start`, the queued handle is its result.
+struct Immediate<'a, F: ?Sized> {
+    forward: &'a F,
+}
+
+impl<'a, F: ?Sized> Immediate<'a, F> {
+    fn new(forward: &'a F) -> Self {
+        Self { forward }
+    }
+}
+
+impl<F: ?Sized> SegmentForward for Immediate<'_, F>
+where
+    F: Fn(&Array3<f32>, &mut dyn TraceSink) -> Result<Array4<f32>>,
+{
+    type Pending = Array4<f32>;
+
+    fn start(&self, padded: &Array3<f32>, trace: &mut dyn TraceSink) -> Result<Array4<f32>> {
+        (self.forward)(padded, trace)
+    }
+
+    fn collect(&self, pending: Array4<f32>, _trace: &mut dyn TraceSink) -> Result<Array4<f32>> {
+        Ok(pending)
+    }
+}
+
+/// [separate] with an injected per-chunk forward — the host path and the tests
+/// pass a closure; the device path passes its own [`SegmentForward`].
 pub fn separate_with(
     model: &Htdemucs,
     forward: &dyn Fn(&Array3<f32>, &mut dyn TraceSink) -> Result<Array4<f32>>,
@@ -207,13 +260,7 @@ pub fn separate_gpu(
     options: SeparateOptions,
     trace: &mut dyn TraceSink,
 ) -> Result<Array4<f32>> {
-    separate_with(
-        model,
-        &|padded, trace| crate::gpu::htdemucs::separate_gpu(model, runner, padded, trace),
-        mix,
-        options,
-        trace,
-    )
+    separate_gpu_progress(model, runner, mix, options, &mut |_, _| {}, trace)
 }
 
 /// [`separate_gpu`] with a per-chunk progress callback (`done`, `total`).
@@ -225,14 +272,8 @@ pub fn separate_gpu_progress(
     on_progress: &mut dyn FnMut(usize, usize),
     trace: &mut dyn TraceSink,
 ) -> Result<Array4<f32>> {
-    separate_with_progress(
-        model,
-        &|padded, trace| crate::gpu::htdemucs::separate_gpu(model, runner, padded, trace),
-        mix,
-        options,
-        on_progress,
-        trace,
-    )
+    let forward = crate::gpu::htdemucs::DeviceForward::new(model, runner);
+    separate_forwarding(model, &forward, mix, options, on_progress, trace)
 }
 
 /// [`separate_with`] with a per-chunk progress callback (`done`, `total`).
@@ -243,6 +284,26 @@ pub fn separate_gpu_progress(
 pub fn separate_with_progress(
     model: &Htdemucs,
     forward: &dyn Fn(&Array3<f32>, &mut dyn TraceSink) -> Result<Array4<f32>>,
+    mix: &Array3<f32>,
+    options: SeparateOptions,
+    on_progress: &mut dyn FnMut(usize, usize),
+    trace: &mut dyn TraceSink,
+) -> Result<Array4<f32>> {
+    separate_forwarding(
+        model,
+        &Immediate::new(forward),
+        mix,
+        options,
+        on_progress,
+        trace,
+    )
+}
+
+/// The shift loop, then the chunking/overlap pass, over either forward
+/// implementation.
+fn separate_forwarding<P>(
+    model: &Htdemucs,
+    forward: &dyn SegmentForward<Pending = P>,
     mix: &Array3<f32>,
     options: SeparateOptions,
     on_progress: &mut dyn FnMut(usize, usize),
@@ -324,9 +385,17 @@ fn forward_batch() -> usize {
 /// batch axis multiplies in. The host path passes 1: its forward is equally
 /// per-segment, so a group would only deepen the overlap bookkeeping for no
 /// gain.
-fn split_pass(
+///
+/// Groups are queued one ahead: iteration n queues group n and then resolves
+/// group n-1, so a `SegmentForward` that submits asynchronously — the device
+/// path does — pays for the readback while the group queued a moment ago is
+/// still running. Groups are still spliced in order, and the window's weights
+/// are summed in the same order, so the overlap-add result is unchanged down to
+/// the rounding: with 1 segment per group the sequence of adds is literally the
+/// same as it was.
+fn split_pass<P>(
     model: &Htdemucs,
-    forward: &dyn Fn(&Array3<f32>, &mut dyn TraceSink) -> Result<Array4<f32>>,
+    forward: &dyn SegmentForward<Pending = P>,
     mix: &Array3<f32>,
     options: SeparateOptions,
     batch_chunks: usize,
@@ -347,64 +416,66 @@ fn split_pass(
 
     let mut out = Array4::<f32>::zeros((batch, sources, channels, length));
     let mut sum_weight = vec![0.0f32; length];
-    let mut offset = 0usize;
     let mut chunks = 0usize;
-    while offset < length {
-        // One group: up to `batch_chunks` segments, all padded to
-        // `segment_length`, forwarded together. The mix's own batch axis rides
-        // along inside each segment's tensor, so the forward's batch is
-        // `group * mix_batch`.
-        let mut spans = Vec::with_capacity(batch_chunks);
-        let mut cursor = offset;
-        while spans.len() < batch_chunks && cursor < length {
-            let chunk_length = (length - cursor).min(segment_length);
-            spans.push((cursor, chunk_length));
-            cursor += stride;
-        }
-        let group = spans.len();
-        let mut padded_group: Vec<Array3<f32>> = Vec::with_capacity(group);
-        for (start, chunk_length) in &spans {
-            padded_group.push(padded_chunk(mix, *start, *chunk_length, segment_length)?);
-        }
-        let mut batched = Array3::<f32>::zeros((group * batch, channels, segment_length));
-        for (slot, padded) in padded_group.iter().enumerate() {
-            batched
-                .slice_mut(s![slot * batch..(slot + 1) * batch, .., ..])
-                .assign(padded);
-        }
-        let chunk_out = forward(&batched, trace)?;
-        for (slot, (start, chunk_length)) in spans.iter().enumerate() {
-            let trimmed = center_trim(
-                &chunk_out
-                    .slice(s![slot * batch..(slot + 1) * batch, .., .., ..])
-                    .to_owned(),
-                *chunk_length,
-            );
-            if trimmed.dim().3 != *chunk_length {
-                return Err(Error::Shape(format!(
-                    "the model returned {} samples for a {chunk_length}-sample chunk",
-                    trimmed.dim().3
-                )));
+    // The group queued last — its spans and its handle — whose results are
+    // still coming.
+    let mut queued: Option<(Vec<(usize, usize)>, P)> = None;
+    let mut offset = 0usize;
+    // One extra turn round the loop: the last iteration has nothing left to
+    // queue and only resolves the tail group.
+    while offset < length || queued.is_some() {
+        let resolved = if offset < length {
+            // One group: up to `batch_chunks` segments, all padded to
+            // `segment_length`, forwarded together. The mix's own batch axis
+            // rides along inside each segment's tensor, so the forward's batch
+            // is `group * mix_batch`.
+            let mut spans = Vec::with_capacity(batch_chunks);
+            let mut cursor = offset;
+            while spans.len() < batch_chunks && cursor < length {
+                let chunk_length = (length - cursor).min(segment_length);
+                spans.push((cursor, chunk_length));
+                cursor += stride;
             }
-            let w_offset = *start;
-            for b in 0..batch {
-                for src in 0..sources {
-                    for c in 0..channels {
-                        for t in 0..*chunk_length {
-                            let w = weight[t];
-                            out[[b, src, c, w_offset + t]] += w * trimmed[[b, src, c, t]];
-                        }
-                    }
-                }
+            let group = spans.len();
+            let mut batched = Array3::<f32>::zeros((group * batch, channels, segment_length));
+            for (slot, (start, chunk_length)) in spans.iter().enumerate() {
+                let padded = padded_chunk(mix, *start, *chunk_length, segment_length)?;
+                batched
+                    .slice_mut(s![slot * batch..(slot + 1) * batch, .., ..])
+                    .assign(&padded);
             }
-            for t in 0..*chunk_length {
-                sum_weight[w_offset + t] += weight[t];
-            }
+            // Queued *before* the previous group is collected: on the device
+            // path that is what keeps the device earning while the host waits
+            // for the readback.
+            let pending = forward.start(&batched, trace)?;
+            offset = cursor;
+            queued.replace((spans, pending))
+        } else {
+            queued.take()
+        };
+        let Some((spans, pending)) = resolved else {
+            continue;
+        };
+        let chunk_out = forward.collect(pending, trace)?;
+        splice_group(
+            &mut out,
+            &mut sum_weight,
+            &chunk_out,
+            &spans,
+            &weight,
+            batch,
+            sources,
+            channels,
+        )?;
+        // One callback per segment, still in segment order. A group larger than
+        // one segment reports its whole group at once; at the default group of
+        // one that is the same call, in the same place, as before.
+        for _ in 0..spans.len() {
             chunks += 1;
             on_progress(chunks, total);
         }
-        offset = cursor;
     }
+    let _ = chunks;
     if sum_weight.iter().cloned().fold(f32::INFINITY, f32::min) <= 0.0 {
         return Err(Error::Shape("overlap-add left samples with no weight".into()));
     }
@@ -417,8 +488,50 @@ fn split_pass(
             }
         }
     }
-    let _ = chunks;
     Ok(out)
+}
+
+/// Overlap-adds one group's output into `out`, weighted, counting each segment
+/// into `sum_weight`.
+fn splice_group(
+    out: &mut Array4<f32>,
+    sum_weight: &mut [f32],
+    chunk_out: &Array4<f32>,
+    spans: &[(usize, usize)],
+    weight: &[f32],
+    batch: usize,
+    sources: usize,
+    channels: usize,
+) -> Result<()> {
+    for (slot, (start, chunk_length)) in spans.iter().enumerate() {
+        let trimmed = center_trim(
+            &chunk_out
+                .slice(s![slot * batch..(slot + 1) * batch, .., .., ..])
+                .to_owned(),
+            *chunk_length,
+        );
+        if trimmed.dim().3 != *chunk_length {
+            return Err(Error::Shape(format!(
+                "the model returned {} samples for a {chunk_length}-sample chunk",
+                trimmed.dim().3
+            )));
+        }
+        let w_offset = *start;
+        for b in 0..batch {
+            for src in 0..sources {
+                for c in 0..channels {
+                    for t in 0..*chunk_length {
+                        let w = weight[t];
+                        out[[b, src, c, w_offset + t]] += w * trimmed[[b, src, c, t]];
+                    }
+                }
+            }
+        }
+        for t in 0..*chunk_length {
+            sum_weight[w_offset + t] += weight[t];
+        }
+    }
+    Ok(())
 }
 
 /// How many segments the split path draws for a mix of `length` samples.
@@ -528,9 +641,12 @@ mod tests {
             segment: Some(0.25),
         };
         let mut trace = crate::demucs::host::NoTrace;
+        // The host forward, wrapped: `split_pass` drives every forward through
+        // the two-phase trait so the device path can leave a chunk in flight.
+        let forward = |padded: &Array3<f32>, trace: &mut dyn TraceSink| model.forward(padded, trace);
         let alone = split_pass(
             &model,
-            &|padded, trace| model.forward(padded, trace),
+            &Immediate::new(&forward),
             &mix,
             options,
             1,
@@ -540,7 +656,7 @@ mod tests {
         .expect("split pass, one chunk at a time");
         let grouped = split_pass(
             &model,
-            &|padded, trace| model.forward(padded, trace),
+            &Immediate::new(&forward),
             &mix,
             options,
             3,

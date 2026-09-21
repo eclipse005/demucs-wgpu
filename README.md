@@ -178,6 +178,9 @@ attention's softmax now writes only the per-row `(max, 1/Σexp)` and the `P·V` 
 exponential into its own `A` staging, so the `(heads·tokens, tokens)` probability matrix is never
 materialised, and the norm kernels no longer walk their tensors strided.
 
+The two `176.3 s track` rows above predate the chunk-loop pipeline (§11.14 of `GEMM_HANDOFF.md`);
+they have not been re-measured, and the same 1.10x applies to the port side.
+
 ## Acceptance baseline
 
 Every acceptance number from here on is measured on the **`htdemucs_ft` vocals specialist** — the
@@ -192,15 +195,17 @@ because the original mix that earlier rounds used is no longer on disk).
 
 | Input | Reference (CUDA) | This port (Vulkan) | Gap | SNR vs reference |
 |-------|------------------|--------------------|-----|------------------|
-| `clip20.wav` | 2.22 s / 8.99x | 1.24 s / 16.07x | port 1.79x ahead | 125.34 dB |
-| `mix176.wav` | 8.17 s / **21.58x** | 9.19 s / **19.17x** | reference 1.13x | 127.17 dB |
+| `clip20.wav` | 2.22 s / 8.99x | 1.12 s / **17.81x** | port 1.98x ahead | 125.34 dB |
+| `mix176.wav` | 7.78 s / **22.67x** | 8.21 s / **21.48x** | reference 1.06x | 127.17 dB |
 
-(A second run of the same binary measured 9.04 s / 19.51x on `mix176`; this machine drifts ±4%, so
-quote the pair, not the digit. The 20 s row carries the reference's own warm-up over 5 chunks; the
-176.3 s row is the one to compare.) On it the port's GPU submission alone is 268 ms per chunk
-against the reference's 264 ms *total*, so the remaining work is inside the kernels first and the
-~24 ms per chunk of host-side cost (input upload 8 ms, bind groups 2 ms, stem readback and
-overlap-add ~13 ms) second.
+(Three alternating runs of each side in one session — reference 7.71/7.78/7.80 s, port
+8.19/8.21/8.21 s — so quote the pair rather than the digit: this machine drifts ±4%. The 20 s row
+carries both sides' warm-up over a handful of chunks; the 176.3 s row is the one to compare, and
+there the port is **1.06x behind** — 265 ms per chunk against the reference's 251 ms. The chunk loop
+queues a segment and resolves the one before it (see §11.14 of `GEMM_HANDOFF.md`), so the ~35 ms per
+chunk of host work — upload, bind groups, submit, readback, overlap-add — now runs under the device
+instead of after it. What is left is the device's own ~246 ms dispatch window plus ~18 ms per chunk
+outside it, which is where the next work goes.)
 
 
 ## Project layout
