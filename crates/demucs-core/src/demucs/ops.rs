@@ -604,6 +604,86 @@ pub fn gelu_in_place(values: &mut [f32]) {
     values.par_iter_mut().for_each(|value| *value = gelu_erf(*value));
 }
 
+/// `glu(group_norm(x))` in one pass: the DConv's `norm2 -> GLU` pair.
+///
+/// The two are separate sweeps today — the norm writes the whole `(2C, inner)`
+/// plane and the GLU reads it back to write half of it, which for the DConv's
+/// 32 calls a segment is 132 MB of traffic a fused form does not pay.
+///
+/// The statistics are [`group_norm`]'s own (same chunks, same f64 accumulation
+/// order) and the two elementwise expressions are its and [`glu`]'s own, so the
+/// result is bit-identical to the pair it replaces rather than merely close.
+pub fn group_norm_glu<D: ndarray::Dimension>(
+    x: &ndarray::Array<f32, D>,
+    groups: usize,
+    weight: &[f32],
+    bias: &[f32],
+) -> Result<ndarray::Array<f32, D>> {
+    let shape = x.shape().to_vec();
+    if shape.len() < 2 {
+        return Err(Error::Shape("group_norm_glu needs at least (batch, channels)".into()));
+    }
+    let (b, c) = (shape[0], shape[1]);
+    if groups == 0 || c % groups != 0 || weight.len() != c || bias.len() != c {
+        return Err(Error::Shape(format!(
+            "group_norm_glu: {c} channels, {groups} groups, {} affine entries",
+            weight.len()
+        )));
+    }
+    let per_group = c / groups;
+    if per_group % 2 != 0 {
+        return Err(Error::Shape(format!(
+            "group_norm_glu needs an even per-group channel count, found {per_group}"
+        )));
+    }
+    let half = per_group / 2;
+    let inner: usize = shape[2..].iter().product();
+    let source = x
+        .as_slice()
+        .ok_or_else(|| Error::Shape("group_norm_glu needs a standard-layout tensor".into()))?;
+    let mut out_shape = shape.clone();
+    out_shape[1] = c / 2;
+    let mut out = vec![0.0f32; b * half * groups * inner];
+
+    // One task per (row, group) pair, in the order `group_norm` walks them.
+    out.par_chunks_mut(half * inner)
+        .enumerate()
+        .for_each(|(pair, dst)| {
+            let group = pair % groups;
+            let chunk = &source[pair * per_group * inner..(pair + 1) * per_group * inner];
+            let count = chunk.len() as f64;
+            let mut sum = 0.0f64;
+            let mut sum_sq = 0.0f64;
+            for value in chunk.iter() {
+                let v = *value as f64;
+                sum += v;
+                sum_sq += v * v;
+            }
+            let mean = sum / count;
+            let variance = (sum_sq / count - mean * mean).max(0.0);
+            let inv = 1.0 / ((variance + 1e-5).sqrt() as f32);
+            let mean = mean as f32;
+            let scale = |channel: usize| inv * weight[group * per_group + channel];
+            let shift = |channel: usize| bias[group * per_group + channel] - mean * scale(channel);
+            for k in 0..half {
+                let (value_scale, value_shift) = (scale(k), shift(k));
+                let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));
+                let values = &chunk[k * inner..(k + 1) * inner];
+                let gates = &chunk[(k + half) * inner..(k + half + 1) * inner];
+                let dst = &mut dst[k * inner..(k + 1) * inner];
+                for i in 0..inner {
+                    let value = values[i] * value_scale + value_shift;
+                    let gate = gates[i] * gate_scale + gate_shift;
+                    dst[i] = value * (1.0 / (1.0 + (-gate).exp()));
+                }
+            }
+        });
+    ndarray::Array::from_shape_vec(ndarray::IxDyn(&out_shape), out)
+        .map_err(|e| Error::Shape(format!("group_norm_glu output: {e}")))?
+        .into_dimensionality::<D>()
+        .map_err(|e| Error::Shape(format!("group_norm_glu output rank: {e}")))
+}
+
 /// `a += b` over two equally shaped tensors.
 pub fn add_in_place_nd<S: ndarray::Data<Elem = f32> + Sync, D: ndarray::Dimension>(
     target: &mut ndarray::Array<f32, D>,

@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use crate::demucs::config::{HtdemucsArch, HtdemucsConfig};
 use crate::demucs::ops::{
     add_in_place_nd, add_nd, channels_to_leading_freq_into, conv1d, conv2d,
-    conv_transpose1d, conv_transpose2d, gelu_in_place, glu, group_norm,
+    conv_transpose1d, conv_transpose2d, gelu_in_place, glu, group_norm, group_norm_glu,
     leading_freq_to_channels_into, layer_norm_rows, linear_3d,
 };
 use crate::demucs::spec::{
@@ -937,14 +937,24 @@ pub fn dconv_forward(branch: &DConvW, x: &Array3<f32>) -> Result<Array3<f32>> {
             let _scope = profile::scope("dconv.conv2");
             conv1d(&y, &layer.conv2, 1, 0, 1)
         };
-        y = {
+        // `norm2 -> GLU` is one sweep when the two are fused: the norm's write
+        // and the GLU's read-back are 132 MB a call at the DConv's sizes.
+        // `DEMUCS_FUSE_NORM_GLU=0` keeps the pair, which is how they were
+        // compared; the fused form is bit-identical (same statistics, same two
+        // elementwise expressions).
+        if std::env::var("DEMUCS_FUSE_NORM_GLU").is_ok_and(|v| v == "0") {
+            y = {
+                let _scope = profile::scope("dconv.norm2");
+                group_norm(&y, 1, &layer.norm2_weight, &layer.norm2_bias)?
+            };
+            y = {
+                let _scope = profile::scope("dconv.glu");
+                glu(&y)?
+            };
+        } else {
             let _scope = profile::scope("dconv.norm2");
-            group_norm(&y, 1, &layer.norm2_weight, &layer.norm2_bias)?
-        };
-        y = {
-            let _scope = profile::scope("dconv.glu");
-            glu(&y)?
-        };
+            y = group_norm_glu(&y, 1, &layer.norm2_weight, &layer.norm2_bias)?;
+        }
         // `LayerScale`: `scale[:, None] * x`, one task per (row, channel) run.
         {
             let (_, channels, inner) = y.dim();
