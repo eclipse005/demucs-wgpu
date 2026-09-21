@@ -282,6 +282,7 @@ impl Htdemucs {
                         &self.weights.tencoder[index],
                         &xt,
                         &format!("tencoder.{index}"),
+                        index,
                         trace,
                     )?
                 };
@@ -296,6 +297,7 @@ impl Htdemucs {
                     &self.weights.encoder[index],
                     &x,
                     &format!("encoder.{index}"),
+                    index,
                     trace,
                 )?
             };
@@ -436,6 +438,7 @@ impl Htdemucs {
                 length_t,
                 last,
                 &format!("tdecoder.{index}"),
+                index,
                 trace,
             )?
             });
@@ -569,6 +572,7 @@ impl Htdemucs {
         layer: &EncLayerW,
         input: &Array4<f32>,
         name: &str,
+        index: usize,
         trace: &mut dyn TraceSink,
     ) -> Result<Array4<f32>> {
         let pad = layer.conv.kernel()[0] / 4;
@@ -587,7 +591,10 @@ impl Htdemucs {
         let (batch, channels, freqs, frames) = y.dim();
         let mut flat = uninit_array((batch * freqs, channels, frames));
         channels_to_leading_freq_into(&y, &mut flat)?;
-        flat = dconv_forward(&layer.dconv, &flat)?;
+        flat = {
+            let _scope = profile::scope_index("dconv.encoder.freq", index);
+            dconv_forward(&layer.dconv, &flat)?
+        };
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), flat.view().into_dyn());
         }
@@ -613,6 +620,7 @@ impl Htdemucs {
         layer: &EncLayerW,
         input: &Array3<f32>,
         name: &str,
+        index: usize,
         trace: &mut dyn TraceSink,
     ) -> Result<Array3<f32>> {
         let stride = self.config.stride;
@@ -635,7 +643,10 @@ impl Htdemucs {
             let _scope = profile::scope("t.gelu");
             gelu_in_place(y.as_slice_mut().expect("standard layout"));
         }
-        let y = dconv_forward(&layer.dconv, &y)?;
+        let y = {
+            let _scope = profile::scope_index("dconv.encoder.time", index);
+            dconv_forward(&layer.dconv, &y)?
+        };
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), y.view().into_dyn());
         }
@@ -740,6 +751,7 @@ impl Htdemucs {
         length: usize,
         last: bool,
         name: &str,
+        index: usize,
         trace: &mut dyn TraceSink,
     ) -> Result<(Array3<f32>, Array3<f32>)> {
         let summed = {
@@ -763,7 +775,10 @@ impl Htdemucs {
             let _scope = profile::scope("t.glu");
             glu(&rewritten)?
         };
-        let pre = dconv_forward(&layer.dconv, &gated)?;
+        let pre = {
+            let _scope = profile::scope_index("dconv.decoder.time", index);
+            dconv_forward(&layer.dconv, &gated)?
+        };
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), pre.view().into_dyn());
         }

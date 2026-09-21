@@ -949,6 +949,22 @@ pub fn dconv_tail_into(
         ArrayView2::from_shape((oc, in_channels), &conv.weight).expect("the weight is (oc, ic)");
     let half = channels;
     let row_len = oc * plane;
+    // The row loop is the only parallelism here: enough for the freq branch (8
+    // to 512 rows), not for the waveform branch, whose DConv is a *single* row.
+    // `(1, 48, 86000)` puts 8.3 M elements of f64 statistics and 4.1 M gated
+    // writes on one thread while the 1x1 GEMM inside the same row still gets the
+    // whole pool (859 GFLOP/s: 0.92 ms of that row's 15.7). Splitting the row
+    // instead gives the statistics and the write a block each.
+    //
+    // Splitting the write measured *slower* once before — 1007.6-1009.1 ms a
+    // segment against 975 for four interleaved serial runs — but that split was
+    // unconditional: it also cut the many-row freq branch, where the row loop
+    // already fills the pool, into 48-768 sub-tasks. Here it is taken only when
+    // `rows` cannot fill the pool on its own. `DEMUCS_DCONV_WIDE_ROW=0` keeps
+    // the row serial.
+    let wide = rows < rayon::current_num_threads()
+        && plane >= 2048
+        && std::env::var("DEMUCS_DCONV_WIDE_ROW").map_or(true, |v| v != "0");
 
     target
         .par_chunks_mut(half * plane)
@@ -978,13 +994,37 @@ pub fn dconv_tail_into(
                 }
                 // `group_norm_glu` with one group: the statistics are this row's.
                 let count = row_len as f64;
-                let mut sum = 0.0f64;
-                let mut sum_sq = 0.0f64;
-                for value in scratch.iter() {
-                    let v = *value as f64;
-                    sum += v;
-                    sum_sq += v * v;
-                }
+                let (sum, sum_sq) = if wide {
+                    // Fixed blocks combined in order, so the f64 result does not
+                    // depend on how the work was scheduled.
+                    let partials: Vec<(f64, f64)> = scratch
+                        .par_chunks(65536)
+                        .map(|block| {
+                            let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+                            for value in block {
+                                let v = *value as f64;
+                                sum += v;
+                                sum_sq += v * v;
+                            }
+                            (sum, sum_sq)
+                        })
+                        .collect();
+                    let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+                    for (block_sum, block_sq) in partials {
+                        sum += block_sum;
+                        sum_sq += block_sq;
+                    }
+                    (sum, sum_sq)
+                } else {
+                    let mut sum = 0.0f64;
+                    let mut sum_sq = 0.0f64;
+                    for value in scratch.iter() {
+                        let v = *value as f64;
+                        sum += v;
+                        sum_sq += v * v;
+                    }
+                    (sum, sum_sq)
+                };
                 let mean = sum / count;
                 let variance = (sum_sq / count - mean * mean).max(0.0);
                 let inv = 1.0 / ((variance + 1e-5).sqrt() as f32);
@@ -1000,17 +1040,36 @@ pub fn dconv_tail_into(
                 // across a segment the write is the tail's largest single item
                 // (202.3 ms of 459.1 for the three parts, against 173.0 for the
                 // GEMM and 83.8 for the statistics).
-                for k in 0..half {
-                    let (value_scale, value_shift) = (scale(k), shift(k));
-                    let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));
-                    let values = &scratch[k * plane..(k + 1) * plane];
-                    let gates = &scratch[(k + half) * plane..(k + half + 1) * plane];
-                    let run = &mut dst[k * plane..(k + 1) * plane];
-                    let layer_scale = gamma[k];
-                    for i in 0..plane {
-                        let value = values[i] * value_scale + value_shift;
-                        let gate = gates[i] * gate_scale + gate_shift;
-                        run[i] += layer_scale * (value * (1.0 / (1.0 + (-gate).exp())));
+                if wide {
+                    // One task per output channel: channel `k` reads rows `k` and
+                    // `k + half` and writes its own row of `dst`, so nothing here
+                    // needs a lock or a reduction. The expressions are the ones
+                    // below, element for element.
+                    dst.par_chunks_mut(plane).enumerate().for_each(|(k, run)| {
+                        let (value_scale, value_shift) = (scale(k), shift(k));
+                        let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));
+                        let values = &scratch[k * plane..(k + 1) * plane];
+                        let gates = &scratch[(k + half) * plane..(k + half + 1) * plane];
+                        let layer_scale = gamma[k];
+                        for i in 0..plane {
+                            let value = values[i] * value_scale + value_shift;
+                            let gate = gates[i] * gate_scale + gate_shift;
+                            run[i] += layer_scale * (value * (1.0 / (1.0 + (-gate).exp())));
+                        }
+                    });
+                } else {
+                    for k in 0..half {
+                        let (value_scale, value_shift) = (scale(k), shift(k));
+                        let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));
+                        let values = &scratch[k * plane..(k + 1) * plane];
+                        let gates = &scratch[(k + half) * plane..(k + half + 1) * plane];
+                        let run = &mut dst[k * plane..(k + 1) * plane];
+                        let layer_scale = gamma[k];
+                        for i in 0..plane {
+                            let value = values[i] * value_scale + value_shift;
+                            let gate = gates[i] * gate_scale + gate_shift;
+                            run[i] += layer_scale * (value * (1.0 / (1.0 + (-gate).exp())));
+                        }
                     }
                 }
             }
