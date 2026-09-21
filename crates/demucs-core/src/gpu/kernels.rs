@@ -402,6 +402,10 @@ pub struct Kernels {
     /// ends with, in one pass instead of a scale, a copy and an add.
     channel_affine_act_add: wgpu::ComputePipeline,
     col2im: wgpu::ComputePipeline,
+    /// The transposed-conv gather with `(kh, kw, stride_h, stride_w)` compiled
+    /// in, keyed by those values: built on first use, since the shape comes from
+    /// the checkpoint rather than from the code.
+    col2im_fixed: std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, usize), wgpu::ComputePipeline>>,
     group_norm: wgpu::ComputePipeline,
     /// The split form of `group_norm`, for slices too big for one workgroup:
     /// a per-segment reduce, a per-pair stats fold, then apply.
@@ -673,6 +677,7 @@ impl Kernels {
                 "channel_affine_act_add",
             )?,
             col2im: gpu.pipeline("col2im", &shaders::col2im(), "col2im")?,
+            col2im_fixed: std::cell::RefCell::new(std::collections::HashMap::new()),
             tanh: gpu.pipeline("tanh_activation", &shaders::tanh(), "tanh_activation")?,
             tanh_bias_in_place: gpu.pipeline(
                 "tanh_bias_in_place",
@@ -2431,10 +2436,11 @@ impl Kernels {
                 m_pad as u32,
             ],
         )?;
+        let pipeline = self.col2im_pipeline(gpu, shape.kernel, shape.stride)?;
         let group = bind_group(
             gpu,
             "col2im",
-            &self.col2im.get_bind_group_layout(0),
+            &pipeline.get_bind_group_layout(0),
             &[
                 (&taps.buffer, taps.offset, (taps.len() * 4) as u64),
                 (&out.buffer, out.offset, (out.len() * 4) as u64),
@@ -2445,7 +2451,7 @@ impl Kernels {
         );
         let total = shape.batch * shape.out_channels * shape.positions_out();
         let (gx, gy) = row_grid(total.div_ceil(ROW_THREADS));
-        recorder.dispatch("col2im", &self.col2im, &group, (gx, gy, 1));
+        recorder.dispatch("col2im", &pipeline, &group, (gx, gy, 1));
         Ok(())
     }
 
@@ -3365,6 +3371,35 @@ impl Kernels {
             )?;
         }
         Ok(())
+    }
+
+    /// The transposed-conv gather, with its kernel and stride baked in when they
+    /// are ones it has seen before.
+    ///
+    /// The shape comes from the checkpoint, so the pipelines are built on first
+    /// use rather than guessed at construction; the generic shader — the same
+    /// code with those four values read from uniforms — stays as the fallback
+    /// for any shape that is not worth specialising.
+    fn col2im_pipeline(
+        &self,
+        gpu: &Gpu,
+        kernel: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<wgpu::ComputePipeline> {
+        if !shaders::col2im_fixed_bake() || stride.0 == 0 || stride.1 == 0 {
+            return Ok(self.col2im.clone());
+        }
+        let key = (kernel.0, kernel.1, stride.0, stride.1);
+        if let Some(compiled) = self.col2im_fixed.borrow().get(&key) {
+            return Ok(compiled.clone());
+        }
+        let compiled = gpu.pipeline(
+            "col2im_fixed",
+            &shaders::col2im_fixed(kernel, stride),
+            "col2im",
+        )?;
+        self.col2im_fixed.borrow_mut().insert(key, compiled.clone());
+        Ok(compiled)
     }
 
     /// `(batch, rows, cols)` copied from one row pitch to another, with the

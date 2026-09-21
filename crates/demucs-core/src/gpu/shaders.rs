@@ -1854,6 +1854,48 @@ fn add_row_bias_in_place(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_i
 /// transposed conv spreads the full sample rate over `out_w`, which a packed
 /// pair would cap at 65535.
 pub fn col2im() -> String {
+    col2im_impl(None)
+}
+
+/// [`col2im`] with the kernel and stride baked in as constants.
+///
+/// The gather's tap loop tests `(o - k) % stride == 0` and then divides by that
+/// stride, for every tap of every output element — sixteen taps and some thirty
+/// integer divisions per element for the decoder's 4x4 stride-2 upsampling,
+/// which is where this kernel's time goes (0.97 ms a dispatch, three times what
+/// the forward gather costs). As constants those are masks and shifts.
+pub fn col2im_fixed(kernel: (usize, usize), stride: (usize, usize)) -> String {
+    col2im_impl(Some((kernel, stride)))
+}
+
+/// Whether the transposed-conv gather bakes its kernel and stride in.
+/// `DEMUCS_COL2IM_BAKE=0` uses the uniform-reading form instead.
+pub fn col2im_fixed_bake() -> bool {
+    std::env::var("DEMUCS_COL2IM_BAKE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+fn col2im_impl(fixed: Option<((usize, usize), (usize, usize))>) -> String {
+    let (consts, kh_src, kw_src, sh_src, sw_src) = match fixed {
+        Some(((kh, kw), (sh, sw))) => (
+            format!(
+                "const KH: u32 = {kh}u;\nconst KW: u32 = {kw}u;\n\
+                 const SH: u32 = {sh}u;\nconst SW: u32 = {sw}u;\n"
+            ),
+            "KH",
+            "KW",
+            "SH",
+            "SW",
+        ),
+        None => (
+            String::new(),
+            "gd.y",
+            "gd.z",
+            "ge.y",
+            "ge.z",
+        ),
+    };
     format!(
         r#"
 @group(0) @binding(0) var<storage, read> P: array<f32>;
@@ -1861,18 +1903,18 @@ pub fn col2im() -> String {
 @group(0) @binding(2) var<uniform> gd: vec4<u32>;  // oc, kh, kw, out_h
 @group(0) @binding(3) var<uniform> ge: vec4<u32>;  // out_w, stride_h, stride_w, in_h
 @group(0) @binding(4) var<uniform> gf: vec4<u32>;  // in_w, batch, pitch, rows
-
+{consts}
 const GRID_X: u32 = 65535u;
 
 @compute @workgroup_size({threads})
 fn col2im(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
     let oc = gd.x;
-    let kh = gd.y;
-    let kw = gd.z;
+    let kh = {kh_src};
+    let kw = {kw_src};
     let out_h = gd.w;
     let out_w = ge.x;
-    let stride_h = ge.y;
-    let stride_w = ge.z;
+    let stride_h = {sh_src};
+    let stride_w = {sw_src};
     let in_h = ge.w;
     let in_w = gf.x;
     let batch = gf.y;
@@ -1913,6 +1955,11 @@ fn col2im(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     Out[i] = acc;
 }}
 "#,
+        consts = consts,
+        kh_src = kh_src,
+        kw_src = kw_src,
+        sh_src = sh_src,
+        sw_src = sw_src,
         threads = ROW_THREADS
     )
 }
