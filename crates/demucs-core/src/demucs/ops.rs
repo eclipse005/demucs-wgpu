@@ -1297,6 +1297,26 @@ pub fn attention_head(
     let n_k = k.dim().0;
     let scaled = scaled_rows(q, scale);
     let mut scores = matmul_bt(&scaled, k);
+    // Normalise on the way out (`softmax_exp_rows`) unless a tracer wants the
+    // probabilities themselves, which `scores_out` asks for.
+    let defer = scores_out.is_none()
+        && std::env::var("DEMUCS_SOFTMAX_DEFER").map_or(true, |v| v != "0");
+    if defer {
+        let sums = softmax_exp_rows(&mut scores);
+        let mut out = matmul(&scores, v);
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(sums.into_par_iter())
+            .for_each(|(mut row, sum)| {
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
+                    for value in row.iter_mut() {
+                        *value *= inv;
+                    }
+                }
+            });
+        return out;
+    }
     softmax_rows(&mut scores);
     let _ = (n_q, n_k);
     let out = matmul(&scores, v);
@@ -1324,6 +1344,36 @@ pub fn softmax_rows(x: &mut Array2<f32>) {
         .map(|row| row.into_slice().expect("contiguous row"))
         .collect();
     rows.into_par_iter().for_each(|row| softmax_in_place(row));
+}
+
+/// `exp(x - max)` per row and the row sums, *without* the final division.
+///
+/// The division is the last of the softmax's five sweeps over a score matrix
+/// that is 28.9 MB per (batch, head) pair and — with eight pairs in flight —
+/// past the L3, so it is the sweep that costs the most. Normalising on the way
+/// out instead folds it into the AV product's output rows, which are
+/// `n_q * 64` floats: 0.7 MB against 28.9 MB.
+///
+/// This is not the same rounding as dividing first — the products carry their
+/// row's sum until the very end — but it is the same arithmetic to within the
+/// f32 rounding of one division per element, and the unnormalised values are
+/// bounded by the same `sum` the normalised ones are.
+pub fn softmax_exp_rows(x: &mut Array2<f32>) -> Vec<f32> {
+    let rows: Vec<&mut [f32]> = x
+        .axis_iter_mut(Axis(0))
+        .map(|row| row.into_slice().expect("contiguous row"))
+        .collect();
+    rows.into_par_iter()
+        .map(|row| {
+            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                *v = (*v - max).exp();
+                sum += *v;
+            }
+            sum
+        })
+        .collect()
 }
 
 /// `torch.arange(n)` as `f32`.
