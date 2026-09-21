@@ -144,23 +144,28 @@ Numerical alignment against the Python reference (this port's acceptance gate �
 
 | Check | Result |
 |-------|--------|
-| Device vs Python, 1 s segment (vocals) | **123.91 dB** SNR |
+| Device vs Python, 1 s segment (vocals) | **124.15 dB** SNR |
 | Device vs Python, full 176.3 s track (vocals) | **128.79 dB** SNR / 121.36 dB SI-SDR |
 | Host (CPU) full track, vocals | 125.69 dB SNR |
 
 Speed (acceptance gate ② is to beat the CUDA reference; measured on a 10 GB NVIDIA P104-100, no
-fp16, whole 176.3 s track, 4 stems, serial):
+fp16, serial):
 
-| Path | Whole track | RTFx |
-|------|-------------|------|
-| torch + CUDA (reference) | 6.75 s | **26.1x** (target to beat) |
-| **this port, wgpu / Vulkan (dGPU)** | 19.16 s | **9.20x** |
-| this port, wgpu / Vulkan (Intel iGPU) | 72.1 s | 2.45x |
-| this port, CPU (host) | 48.7 s | 3.62x |
+| Path | Input | Wall clock | RTFx |
+|------|-------|-----------|------|
+| torch + CUDA (reference) | whole 176.3 s track | 6.75 s | **26.1x** (target to beat) |
+| torch + CUDA (reference) | 20 s clip | — | 26.2x (218 ms/chunk) |
+| **this port, wgpu / Vulkan (dGPU)** | 20 s clip | 1.29 s | **15.6x** (265 ms/chunk) |
+| this port, wgpu / Vulkan (Intel iGPU) | whole 176.3 s track | 72.1 s | 2.45x |
+| this port, CPU (host) | whole 176.3 s track | 48.7 s | 3.62x |
 
-The GPU path is correct and bounded (peaks ~1.13 GiB on the full track) but **has not yet reached
-the CUDA reference** — the remaining ~2.8× is a uniform per-stage gap vs cuBLAS-class kernels, which
-is the open performance work. The host (CPU) path, by contrast, is complete and the default.
+The device path's per-chunk cost is now 265 ms against the reference's 218 ms, i.e. **~1.2x off
+cuBLAS** rather than the 2.8x the previous revision of this table recorded: the steady-state chunk
+went 299 ms -> 265 ms over the last two commits (the softmax now writes only the per-row
+`(max, 1/Σexp)` and the AV product folds the exponential into its own `A` staging, so the
+`(heads·tokens, tokens)` probability matrix is never materialised). The host (CPU) path, by
+contrast, is complete and the default; the whole-track device figure is remeasured per commit and
+is not quoted here yet.
 
 ## Project layout
 

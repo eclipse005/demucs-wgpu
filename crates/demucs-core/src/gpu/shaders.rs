@@ -55,6 +55,8 @@ pub struct Tile {
 /// Row count of the 64x128 convolution tile, exported so the dispatcher's grid
 /// and the compiled shader agree.
 pub const BM64: usize = 64;
+/// Row count of the 96×128 convolution tile.
+pub const BM96: usize = 96;
 
 /// Whether the convolutions fold their im2col gather into the GEMM.
 /// `DEMUCS_CONV_DIRECT=0` restores the materialised patch matrix, which is how the
@@ -103,15 +105,46 @@ pub fn group_norm_combine_stats() -> bool {
         .unwrap_or(true)
 }
 
+/// Segment count below which the apply replays the partials itself instead of
+/// taking a `group_norm_combine` dispatch first.
+///
+/// The combine exists because the replay is O(segments²) per pair; most calls
+/// in the model have only a handful of segments, where the dispatch costs more
+/// than the replay (`group_norm_combine` measured ~50 µs each, 62 of them per
+/// chunk). Replay and combine sum the partials left to right in the same
+/// order, so the two paths are bit-identical. `DEMUCS_GN_COMBINE_WORK=0`
+/// always combines, a huge value never does.
+pub fn group_norm_combine_for(pairs: usize, segments: usize) -> bool {
+    if !group_norm_combine_stats() {
+        return false;
+    }
+    let limit: usize = std::env::var("DEMUCS_GN_COMBINE_WORK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    // The replay costs `pairs * segments` workgroups × `segments` loads each.
+    pairs.saturating_mul(segments).saturating_mul(segments) > limit
+}
+
 /// Whether the convolution's narrow-M tile is used. `DEMUCS_CONV_TILE=128` restores
 /// the square tile, which is how the two were compared.
 pub fn bm64_for_convs() -> bool {
     match std::env::var("DEMUCS_CONV_TILE").ok().as_deref() {
         Some("128") => false,
         Some("64") => true,
+        Some("96") => true,
         // Measured on the DTTNet 20 s clip: 16.87 s with the square tile against
         // 15.14 s with the narrow one, and the outputs identical to the last
         // digit of the SNR test's 129.65 dB. See the README's conv section.
+        _ => true,
+    }
+}
+
+/// 96-row convolution tile for `64 < oc <= 192` (HTDemucs 96 and 192).
+/// `DEMUCS_CONV_TILE=128` or `64` turns it off.
+pub fn bm96_for_convs() -> bool {
+    match std::env::var("DEMUCS_CONV_TILE").ok().as_deref() {
+        Some("128") | Some("64") => false,
         _ => true,
     }
 }
@@ -156,6 +189,18 @@ impl Tile {
     pub const fn bm64_bn128() -> Self {
         Self {
             bm: 64,
+            bn: BN,
+            tx: THREADS_X,
+            ty: THREADS_Y,
+        }
+    }
+
+    /// 96×128: HTDemucs `oc = 96` is one M tile (a 128-row tile wastes 25%),
+    /// and `oc = 192` is two exact tiles rather than two 128-row tiles padded
+    /// to 256.
+    pub const fn bm96_bn128() -> Self {
+        Self {
+            bm: 96,
             bn: BN,
             tx: THREADS_X,
             ty: THREADS_Y,
@@ -231,6 +276,22 @@ pub fn gemm_batched_bn64() -> String {
     gemm_impl_with(Tile::bn64(), true, false, GemmEpilogue::None)
 }
 
+/// The attention's `P·V` with the softmax folded into the `A` staging.
+///
+/// `A` is the *raw* score matrix (`Q Kᵀ`, already scaled by `1/sqrt(d_head)` by
+/// the `exp`'s own factor), and the staging applies
+/// `exp(a * scale - max_row) * inv_row` while it copies, reading the two
+/// per-row statistics [`softmax_stats_warp`] wrote. The probabilities are then
+/// never materialised: the softmax does one read pass instead of a read pass
+/// plus a read-modify-write of the full `(heads·tokens, tokens)` matrix, which
+/// on the 7.8 s segment is 231 MB per call.
+///
+/// Bit-identical to the two-kernel form: the same `exp`, the same subtraction,
+/// and the product is rounded through the same `f32` shared tile.
+pub fn gemm_batched_bn64_row_exp() -> String {
+    gemm_impl_full(Tile::bn64(), true, false, GemmEpilogue::None, false, false, true)
+}
+
 /// The transposed form with a 64-wide N tile, for `Q K^T` when the sequence is
 /// short.
 ///
@@ -293,7 +354,7 @@ pub fn gemm_conv_direct() -> String {
     // Coalesced: the gather's reads are contiguous runs of the input, so the walk
     // that puts consecutive output columns in consecutive lanes turns a warp's
     // request into one 128-byte line.
-    gemm_impl_full(Tile::bm64_bn128(), false, false, GemmEpilogue::None, true, true)
+    gemm_impl_full(Tile::bm64_bn128(), false, false, GemmEpilogue::None, true, true, false)
 }
 
 /// `gemm_conv_direct` with the batch base terms emitted, for a forward that
@@ -304,7 +365,7 @@ pub fn gemm_conv_direct() -> String {
 /// terms measurably cost throughput on this driver, which is why the plain form
 /// stays the batch-1 path rather than this being the only variant.
 pub fn gemm_conv_direct_batched() -> String {
-    gemm_impl_full(Tile::bm64_bn128(), true, false, GemmEpilogue::None, true, true)
+    gemm_impl_full(Tile::bm64_bn128(), true, false, GemmEpilogue::None, true, true, false)
 }
 
 /// The convolution tile with a **coalesced `B` staging walk**.
@@ -323,7 +384,7 @@ pub fn gemm_conv_direct_batched() -> String {
 /// `n` across the lanes instead, so one warp instruction is one 128-byte run, and
 /// only `conv2d_into` uses it.
 pub fn gemm_bm64_coalesced() -> String {
-    gemm_impl_full(Tile::bm64_bn128(), false, false, GemmEpilogue::None, true, false)
+    gemm_impl_full(Tile::bm64_bn128(), false, false, GemmEpilogue::None, true, false, false)
 }
 
 /// The batched forms of the convolution tile, 64x128 with the same B-walk
@@ -338,13 +399,18 @@ pub fn gemm_bm64_coalesced() -> String {
 ///
 /// Distinct from `gemm_batched_bm64`, which is the attention's 64x64 tile.
 pub fn gemm_batched_bm64_bn128() -> String {
-    gemm_impl_full(Tile::bm64_bn128(), true, false, GemmEpilogue::None, false, false)
+    gemm_impl_full(Tile::bm64_bn128(), true, false, GemmEpilogue::None, false, false, false)
+}
+
+/// Batched 96×128 convolution tile. See [`Tile::bm96_bn128`].
+pub fn gemm_batched_bm96_bn128() -> String {
+    gemm_impl_full(Tile::bm96_bn128(), true, false, GemmEpilogue::None, false, false, false)
 }
 
 /// The coalesced-walk form of [`gemm_batched_bm64_bn128`], for
 /// `DEMUCS_GEMM_B_WALK=coalesced`.
 pub fn gemm_batched_bm64_bn128_coalesced() -> String {
-    gemm_impl_full(Tile::bm64_bn128(), true, false, GemmEpilogue::None, true, false)
+    gemm_impl_full(Tile::bm64_bn128(), true, false, GemmEpilogue::None, true, false, false)
 }
 
 /// What the GEMM's epilogue does to each accumulator before it stores it.
@@ -387,6 +453,19 @@ pub fn gemm_bias() -> String {
     gemm_impl_with(Tile::default(), true, false, GemmEpilogue::Bias)
 }
 
+/// Single-batch `transb` with the Linear bias folded into the store.
+/// HTDemucs projections are `transb` + a separate affine; fusing the bias
+/// drops that extra pass. `DEMUCS_LINEAR_BIAS_FUSE=0` restores the split.
+pub fn gemm_transb_plain_bias() -> String {
+    gemm_impl_with(Tile::square(), false, true, GemmEpilogue::Bias)
+}
+
+pub fn linear_bias_fuse() -> bool {
+    std::env::var("DEMUCS_LINEAR_BIAS_FUSE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 pub fn gemm_gelu_bias() -> String {
     gemm_impl_with(Tile::default(), true, false, GemmEpilogue::GeluBias)
 }
@@ -404,7 +483,7 @@ fn gemm_impl(batched: bool, transb: bool) -> String {
 }
 
 fn gemm_impl_with(tile: Tile, batched: bool, transb: bool, ep: GemmEpilogue) -> String {
-    gemm_impl_full(tile, batched, transb, ep, false, false)
+    gemm_impl_full(tile, batched, transb, ep, false, false, false)
 }
 
 fn gemm_impl_full(
@@ -414,6 +493,7 @@ fn gemm_impl_full(
     ep: GemmEpilogue,
     coalesced_b: bool,
     conv_direct: bool,
+    a_row_exp: bool,
 ) -> String {
     assert!(
         !(coalesced_b && transb),
@@ -422,6 +502,10 @@ fn gemm_impl_full(
     assert!(
         !(conv_direct && transb),
         "the conv-direct walk is the plain operand's gather"
+    );
+    assert!(
+        !(a_row_exp && (transb || conv_direct || coalesced_b || !batched)),
+        "the row-exp A path is the batched plain operand's staging"
     );
     let Tile { bm, bn, tx, ty } = tile;
     let tn = bn / tx;
@@ -508,14 +592,24 @@ fn gemm_impl_full(
         // Re-derived rather than carried over: the prefetch above lives inside
         // the same `if` block, but the store runs after the reduction's barrier,
         // outside it.
+        let (lo, hi) = if a_row_exp {
+            (
+                format!("a_row_scale(pfa{e}.x, ast{e})"),
+                format!("a_row_scale(pfa{e}.y, ast{e})"),
+            )
+        } else {
+            (format!("pfa{e}.x"), format!("pfa{e}.y"))
+        };
         store_prefetch.push_str(&format!(
             "        let si{e} = {flat};\n\
              \x20       let sr{e} = si{e} / {row}u;\n\
              \x20       let sc{e} = si{e} % {row}u;\n\
              \x20       As[sr{e} * PW + sc{e}] = vec2<f32>(\n\
-             \x20           select(0.0, pfa{e}.x, k1 + sc{e} * 2u < gd.k),\n\
-             \x20           select(0.0, pfa{e}.y, k1 + sc{e} * 2u + 1u < gd.k));\n",
+             \x20           select(0.0, {lo}, k1 + sc{e} * 2u < gd.k),\n\
+             \x20           select(0.0, {hi}, k1 + sc{e} * 2u + 1u < gd.k));\n",
             row = ROW_SLOTS,
+            lo = lo,
+            hi = hi,
         ));
     }
     for e in 0..slots_b {
@@ -603,17 +697,60 @@ fn gemm_impl_full(
     } else {
         String::new()
     };
+    // The attention's folded softmax: `A` is the raw score matrix and the A
+    // staging rewrites every element as `exp(a*scale - max_row) * inv_row`
+    // from the per-row statistics the softmax kernel wrote. Only
+    // `gemm_batched_bn64_row_exp` turns it on, so the two bindings and the
+    // helper are emitted for that variant alone — an unused binding would not
+    // be in the automatic layout anyway.
+    let row_exp_helper = if a_row_exp {
+        "
+@group(0) @binding(4) var<storage, read> AStats: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> ae: vec4<u32>;  // scale bits, rows per batch, _, _
+
+fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
+    return exp(v * bitcast<f32>(ae.x) - s.x) * s.y;
+}
+"
+            .to_string()
+    } else {
+        String::new()
+    };
+    // The A rows a staging thread owns are the same for every K block, so the
+    // rows' `(max, inv)` pairs are loaded once and reused by both stores.
+    let mut stats_prologue = String::new();
+    if a_row_exp {
+        for e in 0..slots_a {
+            stats_prologue.push_str(&format!(
+                "    let asr{e} = (ty * {tx}u + tx + {e}u * {threads}u) / {row}u;\n\
+                 \x20   let ast{e} = AStats[wid.z * ae.y + m0 + asr{e}];\n",
+                row = ROW_SLOTS,
+            ));
+        }
+    }
     let mut store_stage0 = String::new();
     for e in 0..slots_a {
         let flat = format!("(ty * {tx}u + tx + {e}u * {threads}u)");
+        // With the folded softmax the staged value is rewritten on the way in;
+        // otherwise it goes to shared exactly as loaded.
+        let loaded = |col: &str| {
+            let addr = format!("A[@A@(m0 + wr{e}) * gd.lda + {col}]");
+            if a_row_exp {
+                format!("a_row_scale({addr}, ast{e})")
+            } else {
+                addr
+            }
+        };
         store_stage0.push_str(&format!(
             "        let wi{e} = {flat};\n\
              \x20       let wr{e} = wi{e} / {row}u;\n\
              \x20       let wc{e} = wi{e} % {row}u;\n\
              \x20       As[wr{e} * PW + wc{e}] = vec2<f32>(\n\
-             \x20           select(0.0, A[@A@(m0 + wr{e}) * gd.lda + wc{e} * 2u], wc{e} * 2u < gd.k),\n\
-             \x20           select(0.0, A[@A@(m0 + wr{e}) * gd.lda + wc{e} * 2u + 1u], wc{e} * 2u + 1u < gd.k));\n",
+             \x20           select(0.0, {lo}, wc{e} * 2u < gd.k),\n\
+             \x20           select(0.0, {hi}, wc{e} * 2u + 1u < gd.k));\n",
             row = ROW_SLOTS,
+            lo = loaded(&format!("wc{e} * 2u")),
+            hi = loaded(&format!("wc{e} * 2u + 1u")),
         ));
     }
     for e in 0..slots_b {
@@ -761,7 +898,7 @@ fn gemm_impl_full(
 {b_operand}
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
 @group(0) @binding(3) var<uniform> gd: Dims;
-{conv_helper}
+{conv_helper}{row_exp_helper}
 const BM: u32 = {bm}u;
 const BN: u32 = {bn}u;
 const BK: u32 = {bk}u;
@@ -785,7 +922,7 @@ fn gemm(
     let ty = lid.y;
     let m0 = wid.{m_axis} * BM;
     let n0 = wid.{n_axis} * BN;
-{conv_prologue}{batch_base}
+{conv_prologue}{batch_base}{stats_prologue}
 {accumulators}
 {prefetch_decl}
     let nk = (gd.k + BK - 1u) / BK;
@@ -839,6 +976,7 @@ fn gemm(
             String::new()
         },
         batch_base = batch_base,
+        stats_prologue = stats_prologue,
         accumulators = accumulators,
         prefetch_decl = prefetch_decl,
         store_stage0 = store_stage0,
@@ -855,6 +993,7 @@ fn gemm(
 ".to_string()
         },
         conv_helper = conv_helper,
+        row_exp_helper = row_exp_helper,
         m_axis = m_axis,
         n_axis = n_axis,
         gelu_fn = match ep {
@@ -2106,21 +2245,50 @@ fn softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) 
     let safe_row = min(row, gd.x - 1u);
     let base = safe_row * cols;
 
+    // Two passes, vec4 along the row: each lane owns 4 consecutive columns
+    // and steps by 128. HTDemucs freq softmax is 2688-wide (exact 21 steps).
     var local_max = -3.402823e38;
-    for (var i = lane; i < cols; i = i + LANES) {{
-        local_max = max(local_max, X[base + i] * scale);
+    var local_sum = 0.0;
+    let stride = LANES * 4u;
+    var i = lane * 4u;
+    loop {{
+        if (i + 4u > cols) {{ break; }}
+        let x0 = X[base + i] * scale;
+        let x1 = X[base + i + 1u] * scale;
+        let x2 = X[base + i + 2u] * scale;
+        let x3 = X[base + i + 3u] * scale;
+        let m2 = max(local_max, max(max(x0, x1), max(x2, x3)));
+        let e = exp(local_max - m2);
+        local_sum = local_sum * e + exp(x0 - m2) + exp(x1 - m2) + exp(x2 - m2) + exp(x3 - m2);
+        local_max = m2;
+        i = i + stride;
+    }}
+    loop {{
+        if (i >= cols) {{ break; }}
+        let x = X[base + i] * scale;
+        let m2 = max(local_max, x);
+        local_sum = local_sum * exp(local_max - m2) + exp(x - m2);
+        local_max = m2;
+        i = i + 1u;
     }}
     let row_max = subgroupMax(local_max);
-
-    var local_sum = 0.0;
-    for (var i = lane; i < cols; i = i + LANES) {{
-        local_sum = local_sum + exp(X[base + i] * scale - row_max);
-    }}
+    local_sum = local_sum * exp(local_max - row_max);
     let total = subgroupAdd(local_sum);
     let inv = select(0.0, 1.0 / total, total > 0.0);
     if (row < gd.x) {{
-        for (var i = lane; i < cols; i = i + LANES) {{
-            Out[base + i] = exp(X[base + i] * scale - row_max) * inv;
+        var j = lane * 4u;
+        loop {{
+            if (j + 4u > cols) {{ break; }}
+            Out[base + j] = exp(X[base + j] * scale - row_max) * inv;
+            Out[base + j + 1u] = exp(X[base + j + 1u] * scale - row_max) * inv;
+            Out[base + j + 2u] = exp(X[base + j + 2u] * scale - row_max) * inv;
+            Out[base + j + 3u] = exp(X[base + j + 3u] * scale - row_max) * inv;
+            j = j + stride;
+        }}
+        loop {{
+            if (j >= cols) {{ break; }}
+            Out[base + j] = exp(X[base + j] * scale - row_max) * inv;
+            j = j + 1u;
         }}
     }}
 }}
@@ -2134,6 +2302,84 @@ fn softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) 
 
 /// Rows one warp-per-row softmax workgroup covers.
 pub const SOFTMAX_WARP_ROWS_PER_WG: usize = 8;
+
+/// The same row scan as [`softmax_scaled_warp`], but it writes the two numbers
+/// the probabilities need instead of the probabilities themselves: `(max, 1/Σexp)`
+/// per row, as `vec2<f32>`.
+///
+/// The scaled-exponential form is what `gemm_batched_bn64_row_exp` applies while
+/// it stages its `A` operand, so the `(heads·tokens, tokens)` matrix is never
+/// read twice nor written at all — on the 7.8 s segment that is 462 MB per
+/// attention call. Same max, same sum, same `exp`: the values the GEMM forms are
+/// the ones the two-pass kernel would have written.
+pub fn softmax_stats_warp() -> String {
+    const LANES: u32 = 32;
+    const WARPS: u32 = 8;
+    const THREADS: u32 = LANES * WARPS;
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Stats: array<f32>;  // 2 per row: max, 1/sum
+@group(0) @binding(2) var<uniform> gd: vec4<u32>;  // rows, cols, scale bits, _
+
+const LANES: u32 = {lanes}u;
+const WARPS: u32 = {warps}u;
+const THREADS: u32 = {threads}u;
+const ROW_GRID_X: u32 = {grid_x}u;
+
+@compute @workgroup_size({threads})
+fn softmax_stats(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let cols = gd.y;
+    let scale = bitcast<f32>(gd.z);
+    let warp = lid.x / LANES;
+    let lane = lid.x % LANES;
+    let row = (wid.x + wid.y * ROW_GRID_X) * WARPS + warp;
+    let safe_row = min(row, gd.x - 1u);
+    let base = safe_row * cols;
+
+    // Two passes, vec4 along the row: each lane owns 4 consecutive columns
+    // and steps by 128. HTDemucs freq softmax is 2688-wide (exact 21 steps).
+    var local_max = -3.402823e38;
+    var local_sum = 0.0;
+    let stride = LANES * 4u;
+    var i = lane * 4u;
+    loop {{
+        if (i + 4u > cols) {{ break; }}
+        let x0 = X[base + i] * scale;
+        let x1 = X[base + i + 1u] * scale;
+        let x2 = X[base + i + 2u] * scale;
+        let x3 = X[base + i + 3u] * scale;
+        let m2 = max(local_max, max(max(x0, x1), max(x2, x3)));
+        let e = exp(local_max - m2);
+        local_sum = local_sum * e + exp(x0 - m2) + exp(x1 - m2) + exp(x2 - m2) + exp(x3 - m2);
+        local_max = m2;
+        i = i + stride;
+    }}
+    loop {{
+        if (i >= cols) {{ break; }}
+        let x = X[base + i] * scale;
+        let m2 = max(local_max, x);
+        local_sum = local_sum * exp(local_max - m2) + exp(x - m2);
+        local_max = m2;
+        i = i + 1u;
+    }}
+    let row_max = subgroupMax(local_max);
+    local_sum = local_sum * exp(local_max - row_max);
+    let total = subgroupAdd(local_sum);
+    let inv = select(0.0, 1.0 / total, total > 0.0);
+    // The two reductions leave both values warp-uniform, so one lane stores.
+    if (row < gd.x && lane == 0u) {{
+        Stats[safe_row * 2u] = row_max;
+        Stats[safe_row * 2u + 1u] = inv;
+    }}
+}}
+"#,
+        lanes = LANES,
+        warps = WARPS,
+        threads = THREADS,
+        grid_x = ROW_GRID_X,
+    )
+}
 /// Columns one lane of the warp softmax covers, i.e. the widest row it takes.
 pub const SOFTMAX_WARP_COLS: usize = 64;
 
@@ -2719,10 +2965,26 @@ fn group_norm_apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
 
     let start = segment * segment_len;
     let end = min(start + segment_len, group_size);
-    for (var local = start + lid.x; local < end; local = local + THREADS) {{
-        let offset = base + group_norm_index(local, len, len_stride, channel_stride);
-        let channel = group * per_group + local / len;
-        Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+    // The transformer's position-wise norm stores `(token, channel)` with the
+    // channels contiguous (`channel_stride == 1`) and the token axis exactly
+    // `per_group` floats away — the generic walk below then puts consecutive
+    // lanes `per_group` floats apart, so every lane pulls a 128-byte line to
+    // use 4 bytes of it. When the two axes tile the group (channels fastest),
+    // memory order *is* the element order: same elements, same arithmetic,
+    // one line per lane. Measured on the 1.376M-element slices: 0.91 ms →
+    // 0.06 ms per dispatch.
+    if (channel_stride == 1u && len_stride == per_group) {{
+        for (var local = start + lid.x; local < end; local = local + THREADS) {{
+            let offset = base + local;
+            let channel = group * per_group + local % per_group;
+            Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+        }}
+    }} else {{
+        for (var local = start + lid.x; local < end; local = local + THREADS) {{
+            let offset = base + group_norm_index(local, len, len_stride, channel_stride);
+            let channel = group * per_group + local / len;
+            Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+        }}
     }}
 }}
 "#,
@@ -2790,10 +3052,21 @@ fn group_norm_apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
 
     let start = segment * segment_len;
     let end = min(start + segment_len, group_size);
-    for (var local = start + lid.x; local < end; local = local + THREADS) {{
-        let offset = base + group_norm_index(local, len, len_stride, channel_stride);
-        let channel = group * per_group + local / len;
-        Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+    // See [`group_norm_apply`]: the same memory-order fast path, for the
+    // small-segment case where the replay of the partials replaces the
+    // combine dispatch.
+    if (channel_stride == 1u && len_stride == per_group) {{
+        for (var local = start + lid.x; local < end; local = local + THREADS) {{
+            let offset = base + local;
+            let channel = group * per_group + local % per_group;
+            Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+        }}
+    }} else {{
+        for (var local = start + lid.x; local < end; local = local + THREADS) {{
+            let offset = base + group_norm_index(local, len, len_stride, channel_stride);
+            let channel = group * per_group + local / len;
+            Out[offset] = (X[offset] - mean) * scale * Gamma[channel] + Beta[channel];
+        }}
     }}
 }}
 "#,
@@ -3455,6 +3728,114 @@ fn batch_moments(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     )
 }
 
+/// Segment size of the split `batch_moments`: the plane is cut into
+/// `ceil(plane / this)` pieces, one workgroup each. `DEMUCS_BATCH_MOMENTS_SEG=0`
+/// keeps the single-workgroup scan, which is how the two were compared.
+pub fn batch_moments_segment_elements() -> usize {
+    std::env::var("DEMUCS_BATCH_MOMENTS_SEG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+}
+
+/// First half of the split `batch_moments`: one workgroup per
+/// `(batch item, segment)` writes that segment's `(sum, sum of squares)`.
+///
+/// The single-workgroup form has one workgroup against the whole GPU, so the
+/// frequency branch's 2.75M-element plane measured 2.68 ms — the same
+/// pathology the waveform DConv's group-norm slices had before they were cut
+/// into segments.
+pub fn batch_moments_partial() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Partials: array<f32>;  // 2 per (batch, segment)
+@group(0) @binding(2) var<uniform> gd: vec4<u32>;  // plane, segments, segment_len, batch
+
+const THREADS: u32 = {threads}u;
+const ROW_GRID_X: u32 = {grid_x}u;
+var<workgroup> partial_sum: array<f32, {threads}>;
+var<workgroup> partial_sq: array<f32, {threads}>;
+
+@compute @workgroup_size({threads})
+fn batch_moments_partial(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let plane = gd.x;
+    let segments = gd.y;
+    let segment_len = gd.z;
+    let work = wid.x + wid.y * ROW_GRID_X;
+    let b = work / segments;
+    let segment = work % segments;
+    if (b >= gd.w) {{ return; }}
+
+    let base = b * plane;
+    let start = segment * segment_len;
+    let end = min(start + segment_len, plane);
+    var s = 0.0;
+    var q = 0.0;
+    for (var i = start + lid.x; i < end; i = i + THREADS) {{
+        let v = X[base + i];
+        s = s + v;
+        q = fma(v, v, q);
+    }}
+    partial_sum[lid.x] = s;
+    partial_sq[lid.x] = q;
+    workgroupBarrier();
+    for (var step = THREADS / 2u; step > 0u; step = step / 2u) {{
+        if (lid.x < step) {{
+            partial_sum[lid.x] = partial_sum[lid.x] + partial_sum[lid.x + step];
+            partial_sq[lid.x] = partial_sq[lid.x] + partial_sq[lid.x + step];
+        }}
+        workgroupBarrier();
+    }}
+    if (lid.x == 0u) {{
+        Partials[work * 2u] = partial_sum[0];
+        Partials[work * 2u + 1u] = partial_sq[0];
+    }}
+}}
+"#,
+        threads = ROW_THREADS,
+        grid_x = ROW_GRID_X
+    )
+}
+
+/// Second half of the split `batch_moments`: fold one batch item's segment
+/// partials into `(mean, std)`, with the formula the single-workgroup kernel
+/// uses (unbiased variance).
+pub fn batch_moments_combine() -> String {
+    format!(
+        r#"
+@group(0) @binding(0) var<storage, read> Partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Mean: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Std: array<f32>;
+@group(0) @binding(3) var<uniform> gd: vec4<u32>;  // plane, batch, segments, _
+
+const THREADS: u32 = {threads}u;
+
+@compute @workgroup_size({threads})
+fn batch_moments_combine(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let b = wid.x * THREADS + lid.x;
+    if (b >= gd.y) {{ return; }}
+
+    let plane = gd.x;
+    let segments = gd.z;
+    var s = 0.0;
+    var q = 0.0;
+    let first = b * segments * 2u;
+    for (var i = 0u; i < segments; i = i + 1u) {{
+        s = s + Partials[first + i * 2u];
+        q = q + Partials[first + i * 2u + 1u];
+    }}
+    let n = f32(plane);
+    let mean = s / n;
+    let variance = (q - mean * mean * n) / (n - 1.0);
+    Mean[b] = mean;
+    Std[b] = sqrt(max(variance, 0.0));
+}}
+"#,
+        threads = ROW_THREADS,
+    )
+}
+
 /// `x = (x - mean) / (1e-5 + std)` per batch item, in place.
 pub fn batch_normalize_in_place() -> String {
     format!(
@@ -3578,6 +3959,8 @@ mod tests {
     fn gemm_tiles_divide_evenly() {
         assert_eq!(BM % THREADS_Y, 0);
         assert_eq!(BN % THREADS_X, 0);
+        assert_eq!(BM96 % THREADS_Y, 0);
+        assert_eq!(BM96 * ROW_SLOTS % (THREADS_X * THREADS_Y), 0);
         assert_eq!(BM * BK % (THREADS_X * THREADS_Y), 0);
         assert_eq!(BN * BK % (THREADS_X * THREADS_Y), 0);
         let t = Tile::square();

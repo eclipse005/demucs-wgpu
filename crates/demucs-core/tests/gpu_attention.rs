@@ -672,3 +672,114 @@ fn attention_handles_a_single_band() {
     // Degenerate batching, where the two-level stride collapses.
     run_case(1, 128, 8, 64, 1e-5);
 }
+
+#[test]
+fn the_folded_softmax_product_matches_the_host_reference() {
+    // `softmax_stats` leaves only `(max, 1/sum)` per row behind, and the AV
+    // product forms `exp(a*scale - max) * inv` while it stages its `A` operand.
+    // The reference is the textbook attention product computed on the host, so
+    // this covers both kernels and the contract between them.
+    use demucs_core::gpu::kernels::GemmJob;
+
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let kernels = Kernels::new(&gpu).unwrap();
+    let mut arena = Arena::new(&gpu, 1 << 30);
+
+    let (heads, q_tokens, k_tokens, dim_head) = (2usize, 5, 7, 4);
+    let batch = 1usize;
+    let scale = 1.0 / (dim_head as f32).sqrt();
+    let scores_host = fill(batch * heads * q_tokens * k_tokens, 5);
+    let v_host = fill(batch * heads * k_tokens * dim_head, 11);
+
+    let mut want = vec![0.0f32; batch * heads * q_tokens * dim_head];
+    for b in 0..batch * heads {
+        for i in 0..q_tokens {
+            let row =
+                &scores_host[(b * q_tokens + i) * k_tokens..(b * q_tokens + i + 1) * k_tokens];
+            let row_max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|x| (x * scale - row_max).exp()).collect();
+            let total: f32 = exps.iter().sum();
+            for j in 0..dim_head {
+                let mut acc = 0.0;
+                for t in 0..k_tokens {
+                    acc += (exps[t] / total) * v_host[(b * k_tokens + t) * dim_head + j];
+                }
+                want[(b * q_tokens + i) * dim_head + j] = acc;
+            }
+        }
+    }
+
+    let scores = arena
+        .upload(
+            &gpu,
+            &[batch * heads * q_tokens * k_tokens],
+            &scores_host,
+            "scores",
+        )
+        .unwrap();
+    let v = arena
+        .upload(&gpu, &[batch * heads * k_tokens * dim_head], &v_host, "v")
+        .unwrap();
+    let stats = arena
+        .tensor(&gpu, &[batch * heads * q_tokens, 2], "stats")
+        .unwrap();
+    let ctx = arena
+        .tensor(&gpu, &[batch * heads * q_tokens * dim_head], "ctx")
+        .unwrap();
+
+    let mut recorder = Recorder::new(&gpu);
+    kernels
+        .softmax_stats(
+            &gpu,
+            &mut arena,
+            &mut recorder,
+            &scores,
+            &stats,
+            batch * heads * q_tokens,
+            k_tokens,
+            scale,
+        )
+        .unwrap();
+    kernels
+        .gemm_scores_av_into(
+            &gpu,
+            &mut arena,
+            &mut recorder,
+            &scores,
+            &stats,
+            &v,
+            &ctx,
+            GemmJob {
+                m: q_tokens,
+                n: dim_head,
+                k: k_tokens,
+                lda: k_tokens,
+                ldb: dim_head,
+                ldc: dim_head,
+                batches: batch * heads,
+                inner_count: heads,
+                a_outer: heads * q_tokens * k_tokens,
+                a_inner: q_tokens * k_tokens,
+                b_outer: heads * k_tokens * dim_head,
+                b_inner: k_tokens * dim_head,
+                c_outer: heads * q_tokens * dim_head,
+                c_inner: q_tokens * dim_head,
+                transb: false,
+            },
+            scale,
+        )
+        .unwrap();
+    recorder.submit(&gpu).unwrap();
+
+    let got = read(&gpu, &ctx);
+    let cmp = compare(&want, &got[..want.len()]).unwrap();
+    println!(
+        "folded softmax product: rms_relative={:.3e} max_abs={:.3e}",
+        cmp.rms_relative_error(),
+        cmp.max_abs
+    );
+
+    assert!(cmp.rms_relative_error() < 1e-5);
+}

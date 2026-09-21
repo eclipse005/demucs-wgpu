@@ -28,7 +28,7 @@ use crate::gpu::kernels::{
     pad_ceil, pad_matrix_for, Activation, Col2ImShape, GemmJob, GroupNormShape, Im2ColShape,
     Kernels,
 };
-use crate::gpu::shaders::{BK as BK_C, BN as BN_C};
+use crate::gpu::shaders::{self, BK as BK_C, BN as BN_C};
 use crate::ops::Linear;
 use crate::gpu::shaders::BK;
 use crate::gpu::Gpu;
@@ -1258,31 +1258,39 @@ fn proj_stage(
     tokens: usize,
     ones: &DevTensor,
 ) -> Result<()> {
-    kernels.gemm_into(
-        gpu,
-        arena,
-        recorder,
-        x,
-        &proj.weight,
-        out,
-        GemmJob {
-            m: tokens,
-            n: proj.out_features,
-            k: proj.in_features,
-            lda: proj.in_features,
-            ldb: pad_ceil(proj.in_features, BK_C),
-            ldc: proj.out_features,
-            batches: 1,
-            inner_count: 1,
-            a_outer: 0,
-            a_inner: 0,
-            b_outer: 0,
-            b_inner: 0,
-            c_outer: 0,
-            c_inner: 0,
-            transb: true,
-        },
-    )?;
+    let job = GemmJob {
+        m: tokens,
+        n: proj.out_features,
+        k: proj.in_features,
+        lda: proj.in_features,
+        ldb: pad_ceil(proj.in_features, BK_C),
+        ldc: proj.out_features,
+        batches: 1,
+        inner_count: 1,
+        a_outer: 0,
+        a_inner: 0,
+        b_outer: 0,
+        b_inner: 0,
+        c_outer: 0,
+        c_inner: 0,
+        transb: true,
+    };
+    if shaders::linear_bias_fuse() {
+        kernels.gemm_into_epilogue(
+            gpu,
+            arena,
+            recorder,
+            x,
+            &proj.weight,
+            out,
+            job,
+            Some(&proj.bias),
+            false,
+            false,
+        )?;
+        return Ok(());
+    }
+    kernels.gemm_into(gpu, arena, recorder, x, &proj.weight, out, job)?;
     kernels.channel_affine_act_in_place(
         gpu,
         arena,
@@ -1365,22 +1373,27 @@ impl GpuHtdemucsRunner {
                 transb: true,
             },
         )?;
-        let scaled = arena.tensor(
+        // The softmax's probabilities are never materialised: the AV product
+        // below folds `exp(a*scale - max)/Σexp` into its own `A` staging, so all
+        // this pass leaves behind is the two per-row numbers it needs. At 7.8 s
+        // that skips a 231 MB read-modify-write per attention call.
+        let softmax_scale = 1.0 / (d_head as f32).sqrt();
+        let stats = arena.tensor(
             gpu,
-            &[batch * heads, q_tokens, k_tokens],
-            &format!("{label}.softmax"),
+            &[batch * heads * q_tokens, 2],
+            &format!("{label}.softmax_stats"),
         )?;
-        kernels.softmax_scaled(
-            gpu, arena, recorder, &scores, &scaled, batch * heads * q_tokens, k_tokens,
-            1.0 / (d_head as f32).sqrt(),
+        kernels.softmax_stats(
+            gpu, arena, recorder, &scores, &stats, batch * heads * q_tokens, k_tokens,
+            softmax_scale,
         )?;
         let context = arena.tensor(
             gpu,
             &[batch * heads, q_tokens, d_head],
             &format!("{label}.ctx"),
         )?;
-        kernels.gemm_into(
-            gpu, arena, recorder, &scaled, &v_h, &context,
+        kernels.gemm_scores_av_into(
+            gpu, arena, recorder, &scores, &stats, &v_h, &context,
             GemmJob {
                 m: q_tokens,
                 n: d_head,
@@ -1398,6 +1411,7 @@ impl GpuHtdemucsRunner {
                 c_inner: q_tokens * d_head,
                 transb: false,
             },
+            softmax_scale,
         )?;
         // Head merge: (batch, heads, tokens, d_head) -> (batch, tokens, dim).
         kernels.transpose(gpu, arena, recorder, &context, out, batch, heads, q_tokens, d_head)

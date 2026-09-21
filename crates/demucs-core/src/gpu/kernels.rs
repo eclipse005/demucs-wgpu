@@ -326,6 +326,7 @@ pub struct Kernels {
     /// (see `shaders::gemm_batched_bm64_bn128`).
     gemm_batched_bm64_bn128: wgpu::ComputePipeline,
     gemm_batched_bm64_bn128_coalesced: wgpu::ComputePipeline,
+    gemm_batched_bm96_bn128: wgpu::ComputePipeline,
     /// The same tile with the im2col gather folded into its `B` staging: a
     /// convolution that never materialises a patch matrix.
     gemm_conv_direct: wgpu::ComputePipeline,
@@ -339,10 +340,16 @@ pub struct Kernels {
     /// Batched form with a 64-wide N tile: the AV product's `n = dim_head = 64`
     /// would otherwise leave half of a 128-wide tile computing zeros.
     gemm_batched_bn64: wgpu::ComputePipeline,
+    /// The AV product with the softmax folded into its `A` staging: `A` is the
+    /// raw score matrix and the per-row `(max, 1/Σexp)` come from
+    /// [`Kernels::softmax_stats`].
+    gemm_batched_bn64_row_exp: wgpu::ComputePipeline,
     /// Both tiles 64 wide, for the frequency axis' `60 x 60` attention problem:
     /// there a 128-row M tile computes more zeros than results.
     gemm_transb_bm64: wgpu::ComputePipeline,
     gemm_batched_bm64: wgpu::ComputePipeline,
+    /// Single-batch transb with Linear bias in the epilogue.
+    gemm_transb_plain_bias: wgpu::ComputePipeline,
     /// Plain GEMM with the `nn.Linear` bias folded into the store.
     gemm_bias: wgpu::ComputePipeline,
     /// Plain GEMM with bias and the feed-forward GELU folded into the store.
@@ -406,6 +413,10 @@ pub struct Kernels {
     softmax_warp: Option<wgpu::ComputePipeline>,
     /// Out-of-place scaled softmax, one warp per row, any width.
     softmax_scaled_warp: Option<wgpu::ComputePipeline>,
+    /// The row scan alone: `(max, 1/Σexp)` per row, for the AV product that
+    /// folds the `exp` into its own staging (see
+    /// [`Kernels::softmax_stats`]).
+    softmax_stats_warp: Option<wgpu::ComputePipeline>,
     /// Fused attention for `dim_head == 64`, replacing the score-matrix path.
     flash_attention: wgpu::ComputePipeline,
     /// 4096-point inverse real FFT, one workgroup per spectrogram frame.
@@ -418,6 +429,11 @@ pub struct Kernels {
     stft_rfft4096: wgpu::ComputePipeline,
     /// Per-batch mean and unbiased std.
     batch_moments: wgpu::ComputePipeline,
+    /// The split form of `batch_moments`, for planes too big for one
+    /// workgroup: a per-segment reduce of `(sum, sum of squares)` and a
+    /// per-batch fold of those partials.
+    batch_moments_partial: wgpu::ComputePipeline,
+    batch_moments_combine: wgpu::ComputePipeline,
     /// `(x - mean) / (1e-5 + std)` per batch item.
     batch_normalize_in_place: wgpu::ComputePipeline,
 }
@@ -460,6 +476,11 @@ impl Kernels {
                 &shaders::gemm_batched_bm64_bn128_coalesced(),
                 "gemm",
             )?,
+            gemm_batched_bm96_bn128: gpu.pipeline(
+                "gemm_f32_batched_bm96_bn128",
+                &shaders::gemm_batched_bm96_bn128(),
+                "gemm",
+            )?,
             gemm_conv_direct: gpu.pipeline(
                 "gemm_f32_conv_direct",
                 &shaders::gemm_conv_direct(),
@@ -480,6 +501,11 @@ impl Kernels {
                 &shaders::gemm_batched_bn64(),
                 "gemm",
             )?,
+            gemm_batched_bn64_row_exp: gpu.pipeline(
+                "gemm_f32_batched_bn64_row_exp",
+                &shaders::gemm_batched_bn64_row_exp(),
+                "gemm",
+            )?,
             gemm_transb_bm64: gpu.pipeline(
                 "gemm_f32_transb_bm64",
                 &shaders::gemm_transb_bm64(),
@@ -488,6 +514,11 @@ impl Kernels {
             gemm_batched_bm64: gpu.pipeline(
                 "gemm_f32_batched_bm64",
                 &shaders::gemm_batched_bm64(),
+                "gemm",
+            )?,
+            gemm_transb_plain_bias: gpu.pipeline(
+                "gemm_f32_transb_plain_bias",
+                &shaders::gemm_transb_plain_bias(),
                 "gemm",
             )?,
             gemm_bias: gpu.pipeline("gemm_f32_bias", &shaders::gemm_bias(), "gemm")?,
@@ -624,6 +655,15 @@ impl Kernels {
             } else {
                 None
             },
+            softmax_stats_warp: if gpu.info.shuffle_reduction {
+                Some(gpu.pipeline(
+                    "softmax_stats_warp",
+                    &shaders::softmax_stats_warp(),
+                    "softmax_stats",
+                )?)
+            } else {
+                None
+            },
             flash_attention: gpu.pipeline(
                 "flash_attention",
                 &shaders::flash_attention(),
@@ -649,6 +689,16 @@ impl Kernels {
                 "batch_moments",
                 &shaders::batch_moments(),
                 "batch_moments",
+            )?,
+            batch_moments_partial: gpu.pipeline(
+                "batch_moments_partial",
+                &shaders::batch_moments_partial(),
+                "batch_moments_partial",
+            )?,
+            batch_moments_combine: gpu.pipeline(
+                "batch_moments_combine",
+                &shaders::batch_moments_combine(),
+                "batch_moments_combine",
             )?,
             batch_normalize_in_place: gpu.pipeline(
                 "batch_normalize_in_place",
@@ -757,7 +807,133 @@ impl Kernels {
                 (&params.buffer, params.offset, 64),
             ],
         );
-        recorder.dispatch("gemm_bm64", pipeline, &group, grid);
+        let name = match tile.0 {
+            shaders::BM96 => "gemm_bm96",
+            shaders::BM64 => "gemm_bm64",
+            _ => "gemm",
+        };
+        recorder.dispatch(name, pipeline, &group, grid);
+        Ok(())
+    }
+
+    /// `(max, 1/Σexp)` per row of the scaled softmax, without forming it.
+    ///
+    /// The scan is the one [`Kernels::softmax_scaled`] runs; this is the half of
+    /// it that does not touch memory the AV product reads anyway. Needs the
+    /// warp kernel's 32-lane subgroup reduction.
+    pub fn softmax_stats(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        x: &DevTensor,
+        stats: &DevTensor,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let Some(pipeline) = self.softmax_stats_warp.as_ref() else {
+            return Err(Error::Gpu(
+                "softmax stats needs the 32-lane subgroup reduction".into(),
+            ));
+        };
+        if stats.len() < 2 * rows {
+            return Err(Error::Shape(format!(
+                "softmax stats writes {} values for {rows} rows, the tensor holds {}",
+                2 * rows,
+                stats.len()
+            )));
+        }
+        let params = self.params(gpu, arena, [rows as u32, cols as u32, scale.to_bits(), 0])?;
+        let group = bind_group(
+            gpu,
+            "softmax_stats",
+            &pipeline.get_bind_group_layout(0),
+            &[
+                (&x.buffer, x.offset, (x.len() * 4) as u64),
+                (&stats.buffer, stats.offset, (stats.len() * 4) as u64),
+                (&params.buffer, params.offset, 16),
+            ],
+        );
+        let (gx, gy) = row_grid(rows.div_ceil(shaders::SOFTMAX_WARP_ROWS_PER_WG));
+        recorder.dispatch("softmax_stats", pipeline, &group, (gx, gy, 1));
+        Ok(())
+    }
+
+    /// The attention's `P·V` straight off the raw score matrix: the `A` staging
+    /// applies `exp(a * scale - max_row) * inv_row` from `stats`, which is what
+    /// lets [`Kernels::softmax_stats`] skip materialising the probabilities.
+    ///
+    /// `job` is the one the `(probabilities, v)` product would take; `stats`
+    /// holds two floats per scores row, `(max, 1/Σexp)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_scores_av_into(
+        &self,
+        gpu: &Gpu,
+        arena: &mut Arena,
+        recorder: &mut Recorder,
+        scores: &DevTensor,
+        stats: &DevTensor,
+        b: &DevTensor,
+        c: &DevTensor,
+        job: GemmJob,
+        scale: f32,
+    ) -> Result<()> {
+        if job.m == 0 || job.n == 0 || job.k == 0 {
+            return Ok(());
+        }
+        if job.lda == 0 || job.a_inner % job.lda != 0 {
+            return Err(Error::Shape(format!(
+                "the folded softmax needs whole rows: a_inner {} is not a multiple of lda {}",
+                job.a_inner, job.lda
+            )));
+        }
+        let rows_per_batch = job.a_inner / job.lda;
+        let need = 2 * job.batches * rows_per_batch;
+        if stats.len() < need {
+            return Err(Error::Shape(format!(
+                "the folded softmax needs {need} statistics, the tensor holds {}",
+                stats.len()
+            )));
+        }
+        let dims = GemmDims {
+            m: job.m as u32,
+            n: job.n as u32,
+            k: job.k as u32,
+            lda: job.lda as u32,
+            ldb: job.ldb as u32,
+            ldc: job.ldc as u32,
+            inner_count: job.inner_count as u32,
+            asa_outer: job.a_outer as u32,
+            asa_inner: job.a_inner as u32,
+            bsb_outer: job.b_outer as u32,
+            bsb_inner: job.b_inner as u32,
+            csc_outer: job.c_outer as u32,
+            csc_inner: job.c_inner as u32,
+            _pad: 0,
+        };
+        let params = gpu.push_uniform(bytemuck::bytes_of(&dims))?;
+        let ae = self.params(gpu, arena, [scale.to_bits(), rows_per_batch as u32, 0, 0])?;
+        let group = bind_group(
+            gpu,
+            "gemm_av_row_exp",
+            &self.gemm_batched_bn64_row_exp.get_bind_group_layout(0),
+            &[
+                (&scores.buffer, scores.offset, (scores.len() * 4) as u64),
+                (&b.buffer, b.offset, (b.len() * 4) as u64),
+                (&c.buffer, c.offset, (c.len() * 4) as u64),
+                (&params.buffer, params.offset, 64),
+                (&stats.buffer, stats.offset, (stats.len() * 4) as u64),
+                (&ae.buffer, ae.offset, 16),
+            ],
+        );
+        let grid = job.grid_with(shaders::BM, 64);
+        recorder.dispatch(
+            "gemm_av_row_exp",
+            &self.gemm_batched_bn64_row_exp,
+            &group,
+            grid,
+        );
         Ok(())
     }
 
@@ -1076,12 +1252,20 @@ impl Kernels {
         // *slower* (1147 ms against 1136). The fix for that shape is fewer,
         // bigger dispatches -- the bands batched into one grid -- not a
         // different tile.
-        let (pipeline, tile) = match (bias.is_some(), gelu, residual) {
-            (true, true, _) => (&self.gemm_gelu_bias, square),
-            (true, false, false) => (&self.gemm_bias, square),
-            (false, _, false) => return Err(Error::Gpu("the plain epilogue is `gemm_into`".into())),
-            (false, _, true) => (&self.gemm_residual, square),
-            (true, false, true) => (&self.gemm_bias_residual, square),
+        let (pipeline, tile) = match (job.transb, bias.is_some(), gelu, residual) {
+            (true, true, false, false) => (&self.gemm_transb_plain_bias, square),
+            (true, _, _, _) => {
+                return Err(Error::Gpu(
+                    "the transb epilogue is bias-only, single-batch".into(),
+                ));
+            }
+            (false, true, true, _) => (&self.gemm_gelu_bias, square),
+            (false, true, false, false) => (&self.gemm_bias, square),
+            (false, false, _, false) => {
+                return Err(Error::Gpu("the plain epilogue is `gemm_into`".into()))
+            }
+            (false, false, _, true) => (&self.gemm_residual, square),
+            (false, true, false, true) => (&self.gemm_bias_residual, square),
         };
         let grid = job.grid_with(tile.0, tile.1);
         // The bias binding is declared only when the epilogue uses it: a declared
@@ -1843,7 +2027,7 @@ impl Kernels {
                 &group_partial,
                 (gx, gy, 1),
             );
-            if shaders::group_norm_combine_stats() {
+            if shaders::group_norm_combine_for(pairs, segments) {
                 // Two floats per pair: mean and the already-formed scale.
                 let stats = arena.alloc(gpu, (2 * pairs * 4) as u64, "group_norm.stats")?;
                 let group_combine = bind_group(
@@ -2507,6 +2691,18 @@ impl Kernels {
                 pipeline,
                 (shaders::BM64, shaders::BN),
             )?;
+        } else if out_channels <= 192 && shaders::bm96_for_convs() {
+            self.gemm_into_tile(
+                gpu,
+                arena,
+                recorder,
+                weight,
+                patches,
+                out,
+                job,
+                &self.gemm_batched_bm96_bn128,
+                (shaders::BM96, shaders::BN),
+            )?;
         } else {
             self.gemm_into(gpu, arena, recorder, weight, patches, out, job)?;
         }
@@ -2820,6 +3016,75 @@ impl Kernels {
             )));
         }
         let batch = count / plane;
+        if batch == 0 {
+            return Ok(());
+        }
+        // One workgroup against the whole GPU is fine for a small plane and
+        // terrible for the frequency branch's 2.75M-element one (2.68 ms
+        // measured, 4 GB/s), so the plane is cut into segments once it is
+        // bigger than a workgroup should walk. `DEMUCS_BATCH_MOMENTS_SEG=0`
+        // keeps the single-workgroup form.
+        let segment_elements = shaders::batch_moments_segment_elements();
+        let segments = if segment_elements == 0 {
+            1
+        } else {
+            plane.div_ceil(segment_elements).max(1)
+        };
+        if segments > 1 {
+            let segment_len = plane.div_ceil(segments);
+            let partials = arena.alloc(
+                gpu,
+                (2 * batch * segments * 4) as u64,
+                "batch_moments.partials",
+            )?;
+            let gd = self.params(
+                gpu,
+                arena,
+                [
+                    plane as u32,
+                    segments as u32,
+                    segment_len as u32,
+                    batch as u32,
+                ],
+            )?;
+            let partial_group = bind_group(
+                gpu,
+                "batch_moments_partial",
+                &self.batch_moments_partial.get_bind_group_layout(0),
+                &[
+                    (&x.buffer, x.offset, (count * 4) as u64),
+                    (&partials.buffer, partials.offset, (partials.len() * 4) as u64),
+                    (&gd.buffer, gd.offset, 16),
+                ],
+            );
+            let (gx, gy) = row_grid(batch * segments);
+            recorder.dispatch(
+                "batch_moments_partial",
+                &self.batch_moments_partial,
+                &partial_group,
+                (gx, gy, 1),
+            );
+            let gc = self.params(gpu, arena, [plane as u32, batch as u32, segments as u32, 0])?;
+            let combine_group = bind_group(
+                gpu,
+                "batch_moments_combine",
+                &self.batch_moments_combine.get_bind_group_layout(0),
+                &[
+                    (&partials.buffer, partials.offset, (partials.len() * 4) as u64),
+                    (&mean.buffer, mean.offset, (mean.len() * 4) as u64),
+                    (&std.buffer, std.offset, (std.len() * 4) as u64),
+                    (&gc.buffer, gc.offset, 16),
+                ],
+            );
+            let (cx, cy) = row_grid(batch.div_ceil(shaders::ROW_THREADS));
+            recorder.dispatch(
+                "batch_moments_combine",
+                &self.batch_moments_combine,
+                &combine_group,
+                (cx, cy, 1),
+            );
+            return Ok(());
+        }
         let params = self.params(gpu, arena, [plane as u32, batch as u32, 0, 0])?;
         let group = bind_group(
             gpu,
