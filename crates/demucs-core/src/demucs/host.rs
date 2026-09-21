@@ -614,31 +614,44 @@ impl Htdemucs {
         let stride = self.config.stride;
         let length = input.dim().2;
         let mut x = if length % stride != 0 {
+            let _scope = profile::scope("t.pad");
             pad_right(input, stride - length % stride)
         } else {
             input.clone()
         };
         let pad = layer.conv.kernel()[0] / 4;
-        let mut y = conv1d(&x, &layer.conv, stride, pad, 1);
+        let mut y = {
+            let _scope = profile::scope("t.conv");
+            conv1d(&x, &layer.conv, stride, pad, 1)
+        };
         if trace.wants(&format!("{name}.conv")) {
             trace.record(&format!("{name}.conv"), y.view().into_dyn());
         }
-        gelu_in_place(y.as_slice_mut().expect("standard layout"));
+        {
+            let _scope = profile::scope("t.gelu");
+            gelu_in_place(y.as_slice_mut().expect("standard layout"));
+        }
         let y = dconv_forward(&layer.dconv, &y)?;
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), y.view().into_dyn());
         }
-        let rewritten = conv1d(
-            &y,
-            &layer.rewrite,
-            1,
-            layer.rewrite.kernel()[0] / 2,
-            1,
-        );
+        let rewritten = {
+            let _scope = profile::scope("t.rewrite");
+            conv1d(
+                &y,
+                &layer.rewrite,
+                1,
+                layer.rewrite.kernel()[0] / 2,
+                1,
+            )
+        };
         if trace.wants(&format!("{name}.rewrite")) {
             trace.record(&format!("{name}.rewrite"), rewritten.view().into_dyn());
         }
-        x = glu(&rewritten)?;
+        x = {
+            let _scope = profile::scope("t.glu");
+            glu(&rewritten)?
+        };
         Ok(x)
     }
 
@@ -725,24 +738,36 @@ impl Htdemucs {
         name: &str,
         trace: &mut dyn TraceSink,
     ) -> Result<(Array3<f32>, Array3<f32>)> {
-        let summed = add_nd(x, skip);
-        let rewritten = conv1d(
-            &summed,
-            &layer.rewrite,
-            1,
-            layer.rewrite.kernel()[0] / 2,
-            1,
-        );
+        let summed = {
+            let _scope = profile::scope("t.add");
+            add_nd(x, skip)
+        };
+        let rewritten = {
+            let _scope = profile::scope("t.rewrite");
+            conv1d(
+                &summed,
+                &layer.rewrite,
+                1,
+                layer.rewrite.kernel()[0] / 2,
+                1,
+            )
+        };
         if trace.wants(&format!("{name}.rewrite")) {
             trace.record(&format!("{name}.rewrite"), rewritten.view().into_dyn());
         }
-        let gated = glu(&rewritten)?;
+        let gated = {
+            let _scope = profile::scope("t.glu");
+            glu(&rewritten)?
+        };
         let pre = dconv_forward(&layer.dconv, &gated)?;
         if trace.wants(&format!("{name}.dconv")) {
             trace.record(&format!("{name}.dconv"), pre.view().into_dyn());
         }
 
-        let upsampled = conv_transpose1d(&pre, &layer.conv_tr, self.config.stride);
+        let upsampled = {
+            let _scope = profile::scope("t.conv_tr");
+            conv_transpose1d(&pre, &layer.conv_tr, self.config.stride)
+        };
         if trace.wants(&format!("{name}.conv_tr")) {
             trace.record(&format!("{name}.conv_tr"), upsampled.view().into_dyn());
         }
@@ -754,10 +779,12 @@ impl Htdemucs {
                 pad + length
             )));
         }
-        let mut z = upsampled
-            .slice(s![.., .., pad..pad + length])
-            .to_owned();
+        let mut z = {
+            let _scope = profile::scope("t.crop");
+            upsampled.slice(s![.., .., pad..pad + length]).to_owned()
+        };
         if !last {
+            let _scope = profile::scope("t.gelu");
             gelu_in_place(z.as_slice_mut().expect("standard layout"));
         }
         Ok((z, pre))

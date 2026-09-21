@@ -985,6 +985,12 @@ pub fn dconv_tail_into(
                 let mean = mean as f32;
                 let scale = |channel: usize| inv * norm_weight[channel];
                 let shift = |channel: usize| norm_bias[channel] - mean * scale(channel);
+                // Serial over the row: see `group_norm_glu`. Splitting this
+                // write per output channel (which would give the waveform
+                // branch's single-row DConv 48 tasks) measured *slower* as
+                // well — 1007.6-1009.1 ms a segment against 975 for four
+                // interleaved serial runs — so the exponential in it is not
+                // what that branch's stage time is made of either.
                 for k in 0..half {
                     let (value_scale, value_shift) = (scale(k), shift(k));
                     let (gate_scale, gate_shift) = (scale(k + half), shift(k + half));

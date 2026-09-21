@@ -121,6 +121,11 @@ fn erf(x: f32) -> f32 {
 }
 
 /// Numerically stable softmax over the last axis.
+///
+/// A vectorised polynomial exponential was tried here and measured *slower*
+/// (980.9 against 998.3 ms a segment, paired): this stage is not exponential
+/// bound at all, it is bound by the five sweeps it makes over a 28.9 MB score
+/// matrix per head call. The libm call is hidden behind them.
 pub fn softmax_in_place(row: &mut [f32]) {
     if row.is_empty() {
         return;
