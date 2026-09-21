@@ -127,19 +127,39 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
                     let mut p = 0usize;
                     for oy in row0..row0 + rows_here {
                         let iy = (oy * sh + ky * dh) as isize - ph as isize;
+                        let dst_row = &mut dst[p..p + out_w];
+                        p += out_w;
                         if iy < 0 || iy >= h as isize {
-                            p += out_w;
+                            dst_row.fill(0.0);
                             continue;
                         }
                         let src_row = src.slice(s![iy as usize, ..]);
+                        // A stride-1, undilated tap is a *shifted copy* of the
+                        // source row: the padding is a prefix and a suffix and
+                        // everything between is contiguous. Testing `ix` per
+                        // element costs a compare and a branch per element on
+                        // the one loop that is pure bandwidth — this copies the
+                        // middle run whole and zero-fills the two ends.
+                        if sw == 1 && dw == 1 {
+                            let lo = pw.saturating_sub(kx).min(out_w);
+                            let hi = out_w.min((width + pw).saturating_sub(kx));
+                            let hi = hi.max(lo);
+                            dst_row[..lo].fill(0.0);
+                            dst_row[hi..].fill(0.0);
+                            if hi > lo {
+                                let from = lo + kx - pw;
+                                let run = src_row.slice(s![from..from + (hi - lo)]);
+                                dst_row[lo..hi].copy_from_slice(run.as_slice().unwrap());
+                            }
+                            continue;
+                        }
                         for ox in 0..out_w {
                             let ix = (ox * sw + kx * dw) as isize - pw as isize;
-                            dst[p] = if ix < 0 || ix >= width as isize {
+                            dst_row[ox] = if ix < 0 || ix >= width as isize {
                                 0.0
                             } else {
                                 src_row[ix as usize]
                             };
-                            p += 1;
                         }
                     }
                 });
