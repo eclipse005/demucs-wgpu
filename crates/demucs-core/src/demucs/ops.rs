@@ -436,11 +436,19 @@ pub fn conv_transpose2d<S: ndarray::Data<Elem = f32> + Sync>(
     let out_w = (width - 1) * sw + kw;
     let positions = h * width;
 
-    // One `(oc, ic)` matrix per tap, in tap order.
-    let mut taps = vec![vec![0.0f32; oc * in_channels]; kh * kw];
+    // The taps share one input, so they share one GEMM: stacking them into a
+    // `(kh*kw*oc, ic)` weight lets the crate pack that input once instead of
+    // once per tap, and the much larger `m` it gets is what the tranposed
+    // convolution was missing. The product comes from a pooled buffer as well —
+    // one 16 MB matrix instead of eight fresh 2 MB ones, which is eight rounds
+    // of first-touch page faults a call.
+    //
+    // Tap `ky*kw + kx` occupies rows `[tap*oc, (tap+1)*oc)` of the stack, which
+    // is exactly the layout the fold below reads back.
+    let mut taps = uninit_vec(kh * kw * oc * in_channels);
     for ky in 0..kh {
         for kx in 0..kw {
-            let tap = &mut taps[ky * kw + kx];
+            let tap = &mut taps[(ky * kw + kx) * oc * in_channels..][..oc * in_channels];
             for ic in 0..in_channels {
                 for channel in 0..oc {
                     // The stored weight is `(in_channels, out_channels, kh, kw)`.
@@ -450,32 +458,38 @@ pub fn conv_transpose2d<S: ndarray::Data<Elem = f32> + Sync>(
             }
         }
     }
+    let stacked = ArrayView2::from_shape((kh * kw * oc, in_channels), &taps)
+        .expect("the stacked weight is contiguous");
 
     let mut out = uninit_array((b, oc, out_h, out_w));
     for (channel, value) in w.bias.iter().enumerate() {
         out.slice_mut(s![.., channel, .., ..]).fill(*value);
     }
 
+    let product_len = kh * kw * oc * positions;
     for bi in 0..b {
         let input = x.slice(s![bi, .., .., ..]);
+        // A view: the batch element is already `(ic, h*w)` contiguous, and the
+        // GEMM only reads it.
         let input_2d = input
-            .to_shape((in_channels, positions))
-            .expect("standard layout")
-            .to_owned();
-        for (tap_index, weights) in taps.iter().enumerate() {
-            let (ky, kx) = (tap_index / kw, tap_index % kw);
-            let weight =
-                ArrayView2::from_shape((oc, in_channels), weights).expect("tap is contiguous");
-            let product = matmul(&weight, &input_2d);
-            let values = product.as_slice().expect("standard layout");
+            .view()
+            .into_shape_with_order((in_channels, positions))
+            .expect("standard layout");
+        let mut product = take_scratch(product_len);
+        gemm_into_slice(&mut product[..product_len], &stacked, &input_2d);
 
-            let mut plane = out.slice_mut(s![bi, .., .., ..]);
-            plane
-                .axis_iter_mut(Axis(0))
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(channel, mut target)| {
-                    let source = &values[channel * positions..(channel + 1) * positions];
+        let mut plane = out.slice_mut(s![bi, .., .., ..]);
+        plane
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(channel, mut target)| {
+                // Taps in the order the separate GEMMs used to add them, so the
+                // accumulation per output element is unchanged.
+                for tap_index in 0..kh * kw {
+                    let (ky, kx) = (tap_index / kw, tap_index % kw);
+                    let base = (tap_index * oc + channel) * positions;
+                    let source = &product[base..base + positions];
                     for iy in 0..h {
                         let src = &source[iy * width..(iy + 1) * width];
                         let oy = iy * sh + ky;
@@ -493,8 +507,9 @@ pub fn conv_transpose2d<S: ndarray::Data<Elem = f32> + Sync>(
                             }
                         }
                     }
-                });
-        }
+                }
+            });
+        give_scratch(product);
     }
     out
 }
