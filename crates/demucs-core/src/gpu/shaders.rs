@@ -966,6 +966,22 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
         String::new()
     };
     let mut epilogue = String::new();
+    // Codegen for the store: a column bias is the same for every row of the
+    // tile, so it is loaded once per column here rather than once per store —
+    // eight loads a thread instead of sixty-four. On the row-bias twin the same
+    // hoist was worth more (26.1 -> 22.2 ms on a chunk's worth of conv GEMMs)
+    // than the fold that introduced the load in the first place. The index is
+    // clamped so the load stays inside the tensor; the guard still decides
+    // whether the store happens.
+    let column_bias = ep.has_bias() && ep != GemmEpilogue::RowBias;
+    if column_bias {
+        for j in 0..tn {
+            epilogue.push_str(&format!(
+                "    let gn{j} = n0 + tx + {j}u * TX;\n\
+                 \x20   let cb{j} = Bias[min(gn{j}, gd.n - 1u)];\n"
+            ));
+        }
+    }
     for i in 0..tm {
         epilogue.push_str(&format!("    let gm{i} = m0 + ty + {i}u * TY;\n"));
         epilogue.push_str(&format!("    if (gm{i} < gd.m) {{\n"));
@@ -981,8 +997,8 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
                 // `Bias[row % bias_rows]` with `row` the channel, and `gm{i}` is
                 // that same index within the tile.
                 write = format!("{write} + row_bias{i}");
-            } else if ep.has_bias() {
-                write = format!("{write} + Bias[gn{j}]");
+            } else if column_bias {
+                write = format!("{write} + cb{j}");
             }
             if ep.has_residual() {
                 write = format!("{write} + C[@C@gm{i} * gd.ldc + gn{j}]");
@@ -990,10 +1006,16 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
             if ep == GemmEpilogue::GeluBias {
                 write = format!("gelu_erp({write})");
             }
-            epilogue.push_str(&format!(
-                "        let gn{j} = n0 + tx + {j}u * TX;\n\
-                 \x20       if (gn{j} < gd.n) {{ C[@C@gm{i} * gd.ldc + gn{j}] = {write}; }}\n"
-            ));
+            if column_bias {
+                epilogue.push_str(&format!(
+                    "        if (gn{j} < gd.n) {{ C[@C@gm{i} * gd.ldc + gn{j}] = {write}; }}\n"
+                ));
+            } else {
+                epilogue.push_str(&format!(
+                    "        let gn{j} = n0 + tx + {j}u * TX;\n\
+                     \x20       if (gn{j} < gd.n) {{ C[@C@gm{i} * gd.ldc + gn{j}] = {write}; }}\n"
+                ));
+            }
         }
         epilogue.push_str("    }\n");
     }
