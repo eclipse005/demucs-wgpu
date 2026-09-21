@@ -1283,6 +1283,16 @@ pub fn attention_head(
     // NOTE: a fused softmax+AV was tried and measured *slower* (1469 -> 1758
     // ms/segment): the hand-written AV loop runs at scalar speed while the GEMM
     // it replaces hits 1.1 TFLOP/s. Keep the matrices whole.
+    //
+    // Blocking the queries was tried too, on the theory that the reference's
+    // CPU `_native_multi_head_attention` (which runs the whole attention at
+    // ~1270 GFLOP/s) keeps the score matrix in cache where this port writes it
+    // to DRAM, sweeps it five times and reads it back. Measured on one 7.8 s
+    // segment, paired: the stage does get faster — `attn.heads` 217.6 -> 210.9
+    // ms, four runs against three, no overlap — but the segment is a wash
+    // (959.3 against 962.7), and 256- and 512-row blocks are much worse (the
+    // AV product's `m` shrinks with the block, and with `n = 64` that costs it
+    // most of its parallelism: 265.8 and 253.3 ms for the stage). Reverted.
     let (n_q, _d_head) = q.dim();
     let n_k = k.dim().0;
     let scaled = scaled_rows(q, scale);
