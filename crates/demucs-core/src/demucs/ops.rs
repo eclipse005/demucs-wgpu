@@ -66,22 +66,33 @@ pub fn conv2d<S: ndarray::Data<Elem = f32> + Sync>(
         debug_assert_eq!(out_h, h);
         debug_assert_eq!(out_w, width);
         let mut flat = vec![0.0f32; b * oc * plane];
-        for bi in 0..b {
-            let input = x.slice(s![bi, .., .., ..]);
-            let input_2d = input
-                .to_shape((in_channels, plane))
-                .expect("standard layout")
-                .to_owned();
-            let patch_view = ArrayView2::from_shape((in_channels, plane), input_2d.as_slice().unwrap())
-                .expect("exact size");
-            // (oc, k) @ (k, plane) + bias in one GEMM. Splitting the output
-            // into channel blocks was measured *slower* (165 -> 218 ms across
-            // the segment): each block pays the crate's own parallel dispatch,
-            // and twelve small GEMMs lose to one big one here.
-            let product = matmul_with_row_bias(&weight, &patch_view, &w.bias);
-            let values = product.as_slice().expect("standard layout");
-            flat[bi * oc * plane..(bi + 1) * oc * plane].copy_from_slice(values);
-        }
+        // One GEMM per leading index, the leading indices in parallel.
+        //
+        // This loop *is* the DConv's 1x1 cost: `dconv.conv2` is 4096 of these a
+        // segment (32 scopes of 128) and `dec.rewrite.conv` another 512, each of
+        // them a `(96, 6) @ (6, 336)` — 387 kFLOP, 0.07 ms, 5 GFLOP/s, against a
+        // memory floor two orders of magnitude below that. Serial, the crate's
+        // per-call setup is what the time goes on; the rows have nothing to do
+        // with each other, so they may as well all be in flight at once. Nested
+        // inside rayon the crate's own dispatch does not oversubscribe — it is
+        // the same pool — it just stops being the only thing running.
+        flat.par_chunks_mut(oc * plane)
+            .enumerate()
+            .for_each(|(bi, dst)| {
+                let input = x.slice(s![bi, .., .., ..]);
+                let input_2d = input
+                    .to_shape((in_channels, plane))
+                    .expect("standard layout");
+                let patch_view =
+                    ArrayView2::from_shape((in_channels, plane), input_2d.as_slice().unwrap())
+                        .expect("exact size");
+                // (oc, k) @ (k, plane) + bias in one GEMM. Splitting the output
+                // into channel blocks was measured *slower* (165 -> 218 ms across
+                // the segment): each block pays the crate's own parallel dispatch,
+                // and twelve small GEMMs lose to one big one here.
+                let product = matmul_with_row_bias(&weight, &patch_view, &w.bias);
+                dst.copy_from_slice(product.as_slice().expect("standard layout"));
+            });
         return Array4::from_shape_vec((b, oc, out_h, out_w), flat)
             .expect("the output shape matches");
     }
