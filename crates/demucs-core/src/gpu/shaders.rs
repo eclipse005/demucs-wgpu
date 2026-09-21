@@ -969,6 +969,10 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
     for i in 0..tm {
         epilogue.push_str(&format!("    let gm{i} = m0 + ty + {i}u * TY;\n"));
         epilogue.push_str(&format!("    if (gm{i} < gd.m) {{\n"));
+        if ep == GemmEpilogue::RowBias {
+            // One load per row for the whole tile rather than one per store.
+            epilogue.push_str(&format!("        let row_bias{i} = Bias[gm{i}];\n"));
+        }
         for j in 0..tn {
             let mut write = format!("c{i}_{j}");
             if ep == GemmEpilogue::RowBias {
@@ -976,7 +980,7 @@ fn a_row_scale(v: f32, s: vec2<f32>) -> f32 {
                 // the GEMM lays out along M: `add_row_bias_in_place` adds
                 // `Bias[row % bias_rows]` with `row` the channel, and `gm{i}` is
                 // that same index within the tile.
-                write = format!("{write} + Bias[gm{i}]");
+                write = format!("{write} + row_bias{i}");
             } else if ep.has_bias() {
                 write = format!("{write} + Bias[gn{j}]");
             }
