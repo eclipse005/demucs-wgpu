@@ -4169,7 +4169,28 @@ impl Kernels {
                 )));
             }
         }
-        recorder.dispatch("im2col", &self.im2col, &group, (gx.max(1) as u32, gy.max(1) as u32, out_h.max(1) as u32));
+        // `DEMUCS_PROFILE_CONVS=1` splits the gather's cost by shape instead of
+        // lumping every convolution into one `im2col` row. What that shows: the
+        // 1x1 stride-1 convs — the ones whose patch matrix is just the input
+        // under a wider pitch — are 1.0 ms of the 31.8 ms, so bypassing them is
+        // not worth it; the dilated 1x3/1x5 family is 20.9 ms and the 3x3s are
+        // 7.2 ms.
+        let label = if profile_convs() {
+            format!(
+                "im2col k{} p{} {}x{} s{}x{} pad{}x{}",
+                shape.k(),
+                positions,
+                shape.kernel.0,
+                shape.kernel.1,
+                shape.stride.0,
+                shape.stride.1,
+                shape.pad.0,
+                shape.pad.1
+            )
+        } else {
+            "im2col".to_string()
+        };
+        recorder.dispatch(&label, &self.im2col, &group, (gx.max(1) as u32, gy.max(1) as u32, out_h.max(1) as u32));
         Ok(())
     }
 
@@ -4606,6 +4627,13 @@ fn row_grid(rows: usize) -> (u32, u32) {
 }
 
 /// Rounds `value` up to the next multiple of `tile`.
+/// Whether the per-convolution gathers carry their shape in the timing label.
+/// Read once: the label is built on every dispatch, and this is a hot path.
+fn profile_convs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DEMUCS_PROFILE_CONVS").is_ok())
+}
+
 pub fn pad_ceil(value: usize, tile: usize) -> usize {
     value.div_ceil(tile) * tile
 }
