@@ -131,10 +131,11 @@ impl ModelVariant {
 
 /// Compute backend selection.
 ///
-/// `Auto` picks the best adapter wgpu can see and falls back to the host path
-/// when no device is usable; `Cpu` forces the host path; `Gpu` takes an explicit
-/// adapter selector (`demucs_core::gpu::DeviceSelector`, e.g. `vulkan:1` or
-/// `Intel`) — `demucs adapters` lists what is available.
+/// `Auto` tries a real GPU (discrete, then integrated, then virtual) and falls
+/// back to the host path when none opens. A CPU adapter does not count.
+/// `Cpu` forces the host path. `Gpu` requires that selector and returns
+/// [`Error::Gpu`] when it will not open (`vulkan:1`, `Intel`, …).
+/// `demucs adapters` lists what is available.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Backend {

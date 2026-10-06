@@ -76,7 +76,7 @@ demucs separate <input.wav> -o <out-dir|out.wav> [options]
 
   -m, --model <name|path>     htdemucs | htdemucs_ft | 检查点文件 | ft 目录
   -o, --output <path>         输出目录，或单音轨时的单个 .wav
-      --device <spec>         cpu | auto（有显卡用显卡，否则 CPU）| gpu（没有则报错）| vulkan | vulkan:<idx> | <适配器名子串>
+      --device <spec>         cpu | auto（先独显再集显，否则 CPU）| gpu（先独显再集显，没有则报错）| vulkan | vulkan:<idx> | <适配器名子串>
       --stem <STEM>           只输出该音轨（ASR 速记，等价 --two-stems --other-method none）
       --two-stems <STEM>      音轨 + 伴生轨，与参考 CLI 一致
       --other-method <m>      add | minus | none   （--two-stems 的伴生方式；默认 add）

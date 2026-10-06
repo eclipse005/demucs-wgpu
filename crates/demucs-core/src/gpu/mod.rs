@@ -32,7 +32,7 @@ fn shuffle_reduction_is_safe(info: &wgpu::AdapterInfo, features: wgpu::Features)
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DeviceSelector {
-    /// Best discrete GPU, then integrated, then whatever is left.
+    /// Discrete GPU, then integrated, then virtual. CPU adapters are skipped.
     #[default]
     Auto,
     /// A specific runtime and the n-th adapter of it, e.g. `vulkan:0`.
@@ -89,13 +89,23 @@ impl DeviceSelector {
     }
 }
 
-fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
-    let class = match info.device_type {
+/// Discrete, then integrated, then virtual. A CPU adapter is not a GPU.
+fn device_class(kind: wgpu::DeviceType) -> u8 {
+    match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         wgpu::DeviceType::VirtualGpu => 2,
-        _ => 3,
-    };
+        wgpu::DeviceType::Cpu => 3,
+        _ => 4,
+    }
+}
+
+fn is_real_gpu(info: &wgpu::AdapterInfo) -> bool {
+    device_class(info.device_type) <= 2
+}
+
+fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
+    let class = device_class(info.device_type);
     let api = match info.backend {
         wgpu::Backend::Vulkan => 0,
         wgpu::Backend::Metal => 1,
@@ -229,50 +239,80 @@ impl Gpu {
             .enumerate_adapters(selector.backends())
             .await
             .into_iter()
-            .filter(|adapter| match &selector {
-                DeviceSelector::Auto => true,
-                DeviceSelector::Runtime { api, .. } => adapter.get_info().backend == *api,
-                DeviceSelector::Name(needle) => adapter
-                    .get_info()
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&needle.to_ascii_lowercase()),
+            .filter(|adapter| {
+                let info = adapter.get_info();
+                match &selector {
+                    // Real GPUs only, so a CPU adapter cannot satisfy `auto` / `gpu`.
+                    DeviceSelector::Auto => is_real_gpu(&info),
+                    DeviceSelector::Runtime { api, .. } => info.backend == *api,
+                    DeviceSelector::Name(needle) => info
+                        .name
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase()),
+                }
             })
             .collect();
 
         if hits.is_empty() {
             return Err(Error::Gpu(format!(
-                "no adapter matched {selector:?}; run `demucs kernels` to list what is available"
+                "no adapter matched {selector:?}; run `demucs adapters` to list what is available"
             )));
         }
         hits.sort_by_key(|a| rank(&a.get_info()));
 
-        let adapter = match &selector {
-            DeviceSelector::Runtime { index, .. } => hits.get(*index).ok_or_else(|| {
+        // `Auto` walks discrete, then integrated. A runtime index or a name
+        // stays on that one device.
+        let candidates: Vec<&wgpu::Adapter> = match &selector {
+            DeviceSelector::Runtime { index, .. } => vec![hits.get(*index).ok_or_else(|| {
                 Error::Gpu(format!(
                     "adapter index {index} does not exist ({} found)",
                     hits.len()
                 ))
-            })?,
-            _ => &hits[0],
+            })?],
+            DeviceSelector::Auto => hits.iter().collect(),
+            DeviceSelector::Name(_) => vec![&hits[0]],
         };
 
-        let adapter_info = adapter.get_info();
-        let features = adapter.features();
-        let limits = adapter.limits();
-        // Asking for exactly what the adapter reports means request_device cannot
-        // fail on limits; anything the kernels need beyond this is checked by the
-        // caller against `DeviceInfo`.
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("demucs-wgpu"),
-                required_features: features
-                    & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::SUBGROUP),
-                required_limits: limits.clone(),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| Error::Gpu(format!("request_device: {e}")))?;
+        let mut opened = None;
+        let mut skipped = None;
+        for adapter in &candidates {
+            let adapter_info = adapter.get_info();
+            let features = adapter.features();
+            let limits = adapter.limits();
+            // Asking for exactly what the adapter reports means request_device cannot
+            // fail on limits; anything the kernels need beyond this is checked by the
+            // caller against `DeviceInfo`.
+            match adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("demucs-wgpu"),
+                    required_features: features
+                        & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::SUBGROUP),
+                    required_limits: limits.clone(),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok((device, queue)) => {
+                    opened = Some((adapter_info, features, limits, device, queue));
+                    break;
+                }
+                Err(e) => {
+                    if candidates.len() > 1 {
+                        eprintln!(
+                            "demucs: skip {} ({:?}): {e}",
+                            adapter_info.name, adapter_info.device_type
+                        );
+                    }
+                    skipped = Some(e);
+                }
+            }
+        }
+        let Some((adapter_info, features, limits, device, queue)) = opened else {
+            return Err(Error::Gpu(format!(
+                "request_device: {}",
+                skipped.map(|e| e.to_string()).unwrap_or_else(|| "no adapter opened".into())
+            )));
+        };
 
         device.on_uncaptured_error(std::sync::Arc::new(|error| {
             eprintln!("wgpu error: {error}");
@@ -557,6 +597,14 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_orders_discrete_before_integrated() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        assert!(device_class(DiscreteGpu) < device_class(IntegratedGpu));
+        assert!(device_class(IntegratedGpu) < device_class(VirtualGpu));
+        assert!(device_class(VirtualGpu) < device_class(Cpu));
+    }
 
     #[test]
     fn selector_parses_runtimes_and_names() {
