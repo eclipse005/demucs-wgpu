@@ -59,16 +59,25 @@ enum Command {
 
 /// Which execution path a `--device` value selects.
 enum DeviceChoice {
+    /// GPU when one opens, otherwise the host path.
+    Auto,
     Cpu,
     Gpu(demucs_core::gpu::DeviceSelector),
 }
 
-/// `cpu`, or anything `demucs_core::gpu::DeviceSelector` parses: `auto`, a
-/// runtime with an optional index (`vulkan`, `vulkan:1`), or a substring of the
-/// adapter name (`nvidia`, `intel`). `demucs adapters` lists what is available.
+/// `auto` (GPU, or the host path when none opens), `cpu`, `gpu` (error if no
+/// GPU opens), or anything `DeviceSelector` parses: a runtime with an optional
+/// index (`vulkan`, `vulkan:1`), or a substring of the adapter name.
+/// `demucs adapters` lists what is available.
 fn parse_device(spec: &str) -> Result<DeviceChoice> {
     if spec.eq_ignore_ascii_case("cpu") {
         return Ok(DeviceChoice::Cpu);
+    }
+    if spec.is_empty() || spec.eq_ignore_ascii_case("auto") {
+        return Ok(DeviceChoice::Auto);
+    }
+    if spec.eq_ignore_ascii_case("gpu") {
+        return Ok(DeviceChoice::Gpu(demucs_core::gpu::DeviceSelector::Auto));
     }
     Ok(DeviceChoice::Gpu(demucs_core::gpu::DeviceSelector::parse(spec)?))
 }
@@ -103,8 +112,9 @@ struct SeparateArgs {
     /// Override the model's segment length in seconds.
     #[arg(long)]
     segment: Option<f64>,
-    /// Which execution path to use: `cpu`, `auto`, `vulkan[:index]`, or an
-    /// adapter name substring (see `demucs adapters`).
+    /// Which execution path to use: `cpu`, `auto` (GPU, or CPU when none opens),
+    /// `gpu` (error if no GPU opens), `vulkan[:index]`, or an adapter name
+    /// substring (see `demucs adapters`).
     #[arg(long, default_value = "cpu")]
     device: String,
     /// Print per-stage timings.
@@ -155,7 +165,8 @@ struct BenchArgs {
     model: String,
     #[arg(short, long, default_value_t = 3)]
     repeats: usize,
-    /// `cpu`, `auto`, `vulkan[:index]`, or an adapter name substring.
+    /// `cpu`, `auto` (GPU, or CPU when none opens), `gpu` (error if none opens),
+    /// `vulkan[:index]`, or an adapter name substring.
     #[arg(long, default_value = "cpu")]
     device: String,
 }
@@ -205,6 +216,7 @@ fn model_spec(name: &str) -> Result<(ModelVariant, PathBuf)> {
 /// Turn a `--device` choice into a facade `Backend`.
 fn to_backend(choice: &DeviceChoice) -> Backend {
     match choice {
+        DeviceChoice::Auto => Backend::Auto,
         DeviceChoice::Cpu => Backend::Cpu,
         DeviceChoice::Gpu(selector) => Backend::Gpu(selector.clone()),
     }
@@ -920,19 +932,7 @@ fn bench(args: BenchArgs) -> Result<()> {
         *value = ((rng >> 8) as f32 / 8_388_608.0 - 1.0) * 0.1;
     }
     let seconds = length as f64 / model.config.samplerate as f64;
-    let elapsed = if let DeviceChoice::Gpu(selector) = &device {
-        // The GPU path goes through the same device forward the separation uses,
-        // including its readback, so the number is comparable to `separate`'s.
-        let runner = demucs_core::gpu::htdemucs::GpuHtdemucsRunner::with_selector(&model, selector.clone())
-            .map_err(|e| anyhow::anyhow!("no usable wgpu adapter for `{}`: {e}", args.device))?;
-        let _ = demucs_core::gpu::htdemucs::separate_gpu(&model, &runner, &mix, &mut NoTrace)?;
-        let started = Instant::now();
-        for _ in 0..args.repeats {
-            let out = demucs_core::gpu::htdemucs::separate_gpu(&model, &runner, &mix, &mut NoTrace)?;
-            std::hint::black_box(&out);
-        }
-        started.elapsed().as_secs_f64() / args.repeats as f64
-    } else {
+    let host = || -> Result<f64> {
         // One warm-up so the measurement is of steady-state work.
         let _ = model.forward(&mix, &mut NoTrace)?;
         let started = Instant::now();
@@ -940,7 +940,41 @@ fn bench(args: BenchArgs) -> Result<()> {
             let out = model.forward(&mix, &mut NoTrace)?;
             std::hint::black_box(&out);
         }
-        started.elapsed().as_secs_f64() / args.repeats as f64
+        Ok(started.elapsed().as_secs_f64() / args.repeats as f64)
+    };
+    let on_gpu = |runner: &demucs_core::gpu::htdemucs::GpuHtdemucsRunner| -> Result<f64> {
+        // The GPU path goes through the same device forward the separation uses,
+        // including its readback, so the number is comparable to `separate`'s.
+        let _ = demucs_core::gpu::htdemucs::separate_gpu(&model, runner, &mix, &mut NoTrace)?;
+        let started = Instant::now();
+        for _ in 0..args.repeats {
+            let out = demucs_core::gpu::htdemucs::separate_gpu(&model, runner, &mix, &mut NoTrace)?;
+            std::hint::black_box(&out);
+        }
+        Ok(started.elapsed().as_secs_f64() / args.repeats as f64)
+    };
+    let elapsed = match &device {
+        DeviceChoice::Cpu => host()?,
+        DeviceChoice::Auto => {
+            match demucs_core::gpu::htdemucs::GpuHtdemucsRunner::with_selector(
+                &model,
+                demucs_core::gpu::DeviceSelector::Auto,
+            ) {
+                Ok(runner) => on_gpu(&runner)?,
+                Err(e) => {
+                    eprintln!("demucs: no usable wgpu adapter ({e}); using the host path");
+                    host()?
+                }
+            }
+        }
+        DeviceChoice::Gpu(selector) => {
+            let runner = demucs_core::gpu::htdemucs::GpuHtdemucsRunner::with_selector(
+                &model,
+                selector.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("no usable wgpu adapter for `{}`: {e}", args.device))?;
+            on_gpu(&runner)?
+        }
     };
     println!(
         "chunk forward {:.1} ms for {:.3}s of audio -> {:.2}x raw ({:.1} GB/s of input audio)",
@@ -966,6 +1000,37 @@ fn adapters() -> Result<()> {
             entry.runtime, entry.index, entry.name, entry.kind
         );
     }
-    println!("accepts: cpu | auto | <runtime>[:<idx>] | <name substring>, e.g. `--device intel`");
+    println!(
+        "accepts: cpu | auto | gpu | <runtime>[:<idx>] | <name substring>, e.g. `--device intel`"
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_words_are_policies() {
+        assert!(matches!(parse_device("auto").unwrap(), DeviceChoice::Auto));
+        assert!(matches!(parse_device("").unwrap(), DeviceChoice::Auto));
+        assert!(matches!(parse_device("cpu").unwrap(), DeviceChoice::Cpu));
+        assert!(matches!(
+            parse_device("GPU").unwrap(),
+            DeviceChoice::Gpu(demucs_core::gpu::DeviceSelector::Auto)
+        ));
+        let DeviceChoice::Gpu(sel) = parse_device("vulkan:1").unwrap() else {
+            panic!("vulkan:1 should be a required GPU");
+        };
+        assert_eq!(
+            format!("{sel:?}"),
+            format!("{:?}", demucs_core::gpu::DeviceSelector::parse("vulkan:1").unwrap())
+        );
+        assert!(matches!(to_backend(&DeviceChoice::Auto), Backend::Auto));
+        assert!(matches!(to_backend(&DeviceChoice::Cpu), Backend::Cpu));
+        assert!(matches!(
+            to_backend(&DeviceChoice::Gpu(demucs_core::gpu::DeviceSelector::Auto)),
+            Backend::Gpu(demucs_core::gpu::DeviceSelector::Auto)
+        ));
+    }
 }

@@ -47,6 +47,11 @@ impl DeviceSelector {
         if spec.is_empty() || spec.eq_ignore_ascii_case("auto") {
             return Ok(DeviceSelector::Auto);
         }
+        if spec.eq_ignore_ascii_case("cpu") || spec.eq_ignore_ascii_case("gpu") {
+            return Err(Error::Gpu(format!(
+                "`{spec}` is a backend, not an adapter name — pass it to `--device` or `Backend`"
+            )));
+        }
         // `<runtime>[:<index>]`
         let (head, tail) = match spec.split_once(':') {
             Some((head, tail)) => (head, Some(tail)),
@@ -581,6 +586,8 @@ mod tests {
     fn selector_rejects_an_index_on_a_name() {
         assert!(DeviceSelector::parse("nvidia:2").is_err());
         assert!(DeviceSelector::parse("vulkan:x").is_err());
+        assert!(DeviceSelector::parse("cpu").is_err());
+        assert!(DeviceSelector::parse("gpu").is_err());
     }
 
     /// `AdapterInfo` has no `Default` and keeps gaining fields, so build one from

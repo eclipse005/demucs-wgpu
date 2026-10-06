@@ -632,10 +632,12 @@ fn make_runner(host: &Htdemucs, backend: &Backend, path: &Path) -> Result<Option
         })
 }
 
-fn describe(backend: &Backend, runner: Option<&GpuHtdemucsRunner>) -> String {
+fn describe(_backend: &Backend, runner: Option<&GpuHtdemucsRunner>) -> String {
     match runner {
         Some(runner) => format!("wgpu:{}", runner.device_name()),
-        None => backend.tag().to_string(),
+        // Auto's fallback leaves no runner. The tag of the request would still
+        // say "auto"; the process is on the host path, so say so.
+        None => "cpu".to_string(),
     }
 }
 

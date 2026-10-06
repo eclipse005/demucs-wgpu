@@ -76,7 +76,7 @@ demucs separate <input.wav> -o <out-dir|out.wav> [options]
 
   -m, --model <name|path>     htdemucs | htdemucs_ft | a checkpoint file | an ft directory
   -o, --output <path>         output directory, or a single .wav for one stem
-      --device <spec>         cpu | auto | vulkan | vulkan:<idx> | <adapter-name substring>
+      --device <spec>         cpu | auto (GPU, else CPU) | gpu (error if none) | vulkan | vulkan:<idx> | <adapter-name substring>
       --stem <STEM>           write only this stem (ASR shorthand for --two-stems --other-method none)
       --two-stems <STEM>      stem + companion, like the reference CLI
       --other-method <m>      add | minus | none   (companion for --two-stems; default add)
