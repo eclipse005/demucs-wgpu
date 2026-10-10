@@ -9,6 +9,7 @@
 use ndarray::{Array3, Array4, s};
 
 use crate::demucs::host::{Htdemucs, TraceSink};
+use crate::demucs::mix::MixSamples;
 use crate::error::{Error, Result};
 
 /// Inference settings, mirroring the CLI defaults of `demucs.separate`.
@@ -275,10 +276,10 @@ pub fn separate_with_progress(
 }
 
 /// Host-path streaming emit (no full Array4 when `shifts <= 1`).
-pub fn separate_emit_host<F>(
+pub fn separate_emit_host<F, M>(
     model: &Htdemucs,
     forward: &dyn Fn(&Array3<f32>, &mut dyn TraceSink) -> Result<Array4<f32>>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     on_progress: &mut dyn FnMut(usize, usize),
     on_frame: &mut F,
@@ -286,6 +287,7 @@ pub fn separate_emit_host<F>(
 ) -> Result<()>
 where
     F: FnMut(usize, &[f32]) -> Result<()>,
+    M: MixSamples + ?Sized,
 {
     separate_forwarding_emit(
         model,
@@ -299,10 +301,10 @@ where
 }
 
 /// GPU-path streaming emit (no full Array4 when `shifts <= 1`).
-pub fn separate_emit_gpu<F>(
+pub fn separate_emit_gpu<F, M>(
     model: &Htdemucs,
     runner: &crate::gpu::htdemucs::GpuHtdemucsRunner,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     on_progress: &mut dyn FnMut(usize, usize),
     on_frame: &mut F,
@@ -310,6 +312,7 @@ pub fn separate_emit_gpu<F>(
 ) -> Result<()>
 where
     F: FnMut(usize, &[f32]) -> Result<()>,
+    M: MixSamples + ?Sized,
 {
     let forward = crate::gpu::htdemucs::DeviceForward::new(model, runner);
     separate_forwarding_emit(
@@ -329,15 +332,20 @@ where
 /// Accumulates into an `Array4` for callers that need the full tensor (tests /
 /// in-memory API). Prefer [`separate_forwarding_emit`] when writing stems —
 /// for `shifts <= 1` that path never materialises O(T) output.
-fn separate_forwarding<P>(
+fn separate_forwarding<P, M>(
     model: &Htdemucs,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     on_progress: &mut dyn FnMut(usize, usize),
     trace: &mut dyn TraceSink,
-) -> Result<Array4<f32>> {
-    let (batch, channels, length) = mix.dim();
+) -> Result<Array4<f32>>
+where
+    M: MixSamples + ?Sized,
+{
+    let batch = mix.batch();
+    let channels = mix.channels();
+    let length = mix.length();
     let sources = model.config.sources.len();
     let mut out = Array4::<f32>::zeros((batch, sources, channels, length));
     separate_forwarding_emit(
@@ -367,11 +375,12 @@ fn separate_forwarding<P>(
 /// `on_frame(t, frame)` receives original-timeline sample index `t` and a flat
 /// `[b][src][c]` frame. Frames arrive in increasing `t` order with no gaps.
 /// For `shifts > 1` an O(T) accumulator is still used internally (then emitted);
-/// use `shifts <= 1` for O(segment) peak output RAM.
-pub fn separate_forwarding_emit<P, F>(
+/// use `shifts <= 1` for O(segment) peak output RAM. Peak *input* RAM is O(segment)
+/// when `mix` is a [`crate::demucs::mix::WindowedMix`].
+pub fn separate_forwarding_emit<P, F, M>(
     model: &Htdemucs,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     on_progress: &mut dyn FnMut(usize, usize),
     on_frame: &mut F,
@@ -379,8 +388,11 @@ pub fn separate_forwarding_emit<P, F>(
 ) -> Result<()>
 where
     F: FnMut(usize, &[f32]) -> Result<()>,
+    M: MixSamples + ?Sized,
 {
-    let (batch, channels, length) = mix.dim();
+    let batch = mix.batch();
+    let channels = mix.channels();
+    let length = mix.length();
     let sources = model.config.sources.len();
     let batch_chunks = forward_batch();
     let frame_width = batch * sources * channels;

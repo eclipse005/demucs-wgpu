@@ -181,7 +181,7 @@ pub fn read_flac(path: impl AsRef<Path>) -> Result<Audio> {
 }
 
 /// Bytes of PCM per interleaved frame for a (tag, bits) pair.
-fn wav_bytes_per_frame(channels: usize, bits: u16) -> Result<usize> {
+pub(crate) fn wav_bytes_per_frame(channels: usize, bits: u16) -> Result<usize> {
     let bps = (bits as usize) / 8;
     if bps == 0 || bits as usize % 8 != 0 {
         return Err(Error::Audio(format!("unsupported bits per sample {bits}")));
@@ -206,7 +206,7 @@ fn probe_wav(reader: &mut (impl Read + Seek)) -> Result<AudioInfo> {
 }
 
 /// Walk RIFF chunks; on return the reader is positioned at the start of PCM.
-fn scan_wav_header(
+pub(crate) fn scan_wav_header(
     reader: &mut (impl Read + Seek),
 ) -> Result<(u16, usize, u32, u16, usize, u64)> {
     let mut header = [0u8; 12];
@@ -273,7 +273,7 @@ fn scan_wav_header(
 }
 
 /// Decode one interleaved PCM frame into `out[ch]`.
-fn decode_frame(format_tag: u16, bits: u16, frame: &[u8], channels: usize, out: &mut [f32]) {
+pub(crate) fn decode_frame(format_tag: u16, bits: u16, frame: &[u8], channels: usize, out: &mut [f32]) {
     debug_assert_eq!(out.len(), channels);
     match (format_tag, bits) {
         (3, 32) | (0xFFFE, 32) => {

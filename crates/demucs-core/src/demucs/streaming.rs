@@ -11,8 +11,11 @@
 use ndarray::{s, Array3, Array4};
 
 use crate::demucs::host::{Htdemucs, TraceSink};
+use crate::demucs::mix::{
+    padded_chunk_mix, padded_chunk_shifted_mix, MixSamples,
+};
 use crate::demucs::pipeline::{
-    center_trim, padded_chunk, transition_weight, GlobalNorm, SegmentForward, SeparateOptions,
+    center_trim, transition_weight, GlobalNorm, SegmentForward, SeparateOptions,
 };
 use crate::error::{Error, Result};
 
@@ -88,66 +91,6 @@ pub fn num_chunks_for(length: usize, _segment_length: usize, stride: usize) -> u
     } else {
         (length + stride - 1) / stride
     }
-}
-
-#[inline]
-fn mix_at_padded(
-    mix: &Array3<f32>,
-    batch: usize,
-    channel: usize,
-    padded_index: isize,
-    max_shift: usize,
-    mix_length: usize,
-) -> f32 {
-    let mix_index = padded_index - max_shift as isize;
-    if mix_index < 0 || mix_index >= mix_length as isize {
-        0.0
-    } else {
-        mix[[batch, channel, mix_index as usize]]
-    }
-}
-
-/// One `TensorChunk(...).padded(target_length)` on the shifted view, without a
-/// full `length + 2 * max_shift` allocation.
-fn padded_chunk_shifted(
-    mix: &Array3<f32>,
-    shift_offset: usize,
-    max_shift: usize,
-    mix_length: usize,
-    view_start: usize,
-    chunk_length: usize,
-    target_length: usize,
-) -> Result<Array3<f32>> {
-    let (batch, channels, _) = mix.dim();
-    let view_length = mix_length + max_shift - shift_offset;
-    if view_start >= view_length {
-        return Err(Error::Shape(format!(
-            "chunk offset {view_start} is past the {view_length}-sample shifted signal"
-        )));
-    }
-    let delta = target_length.checked_sub(chunk_length).ok_or_else(|| {
-        Error::Shape(format!(
-            "cannot pad {chunk_length} samples down to {target_length}"
-        ))
-    })?;
-    // Same indexing as `TensorChunk.padded` / `pipeline::padded_chunk`.
-    let start = view_start as isize - (delta / 2) as isize;
-    let mut out = Array3::<f32>::zeros((batch, channels, target_length));
-    for b in 0..batch {
-        for c in 0..channels {
-            for i in 0..target_length {
-                let view_index = start + i as isize;
-                let sample = if view_index < 0 || view_index >= view_length as isize {
-                    0.0
-                } else {
-                    let padded_index = shift_offset as isize + view_index;
-                    mix_at_padded(mix, b, c, padded_index, max_shift, mix_length)
-                };
-                out[[b, c, i]] = sample;
-            }
-        }
-    }
-    Ok(out)
 }
 
 struct OlaRing {
@@ -321,10 +264,10 @@ impl OlaRing {
 ///
 /// `frame` layout: `[b][src][c]` flat. With [`ShiftView`], indexes the virtually
 /// padded shifted mix from `apply.py` (no full-length pad buffer).
-pub fn stream_split_pass<P, F>(
+pub fn stream_split_pass<P, F, M>(
     model: &Htdemucs,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     batch_chunks: usize,
     shift: Option<ShiftView>,
@@ -334,6 +277,7 @@ pub fn stream_split_pass<P, F>(
 ) -> Result<()>
 where
     F: FnMut(usize, &[f32]) -> Result<()>,
+    M: MixSamples + ?Sized,
 {
     stream_split_pass_meta(
         &SplitMeta::from_model(model),
@@ -349,10 +293,10 @@ where
 }
 
 /// Like [`stream_split_pass`] but with explicit [`SplitMeta`] (for tests / mocks).
-pub fn stream_split_pass_meta<P, F>(
+pub fn stream_split_pass_meta<P, F, M>(
     meta: &SplitMeta,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     batch_chunks: usize,
     shift: Option<ShiftView>,
@@ -362,8 +306,11 @@ pub fn stream_split_pass_meta<P, F>(
 ) -> Result<()>
 where
     F: FnMut(usize, &[f32]) -> Result<()>,
+    M: MixSamples + ?Sized,
 {
-    let (batch, channels, mix_length) = mix.dim();
+    let batch = mix.batch();
+    let channels = mix.channels();
+    let mix_length = mix.length();
     let sources = meta.sources;
     let segment_seconds = options.segment.unwrap_or(meta.segment);
     let segment_length = (meta.samplerate as f64 * segment_seconds) as usize;
@@ -409,9 +356,9 @@ where
             let mut batched = Array3::<f32>::zeros((group * batch, channels, segment_length));
             for (slot, (start, chunk_length)) in spans.iter().enumerate() {
                 let padded = if max_shift == 0 {
-                    padded_chunk(mix, *start, *chunk_length, segment_length)?
+                    padded_chunk_mix(mix, *start, *chunk_length, segment_length)?
                 } else {
-                    padded_chunk_shifted(
+                    padded_chunk_shifted_mix(
                         mix,
                         shift_offset,
                         max_shift,
@@ -453,16 +400,19 @@ where
 }
 
 /// Collect streaming split into a dense `Array4` (tests / in-memory callers).
-pub fn stream_split_pass_collect<P>(
+pub fn stream_split_pass_collect<P, M>(
     model: &Htdemucs,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     batch_chunks: usize,
     shift: Option<ShiftView>,
     on_progress: &mut dyn FnMut(usize, usize),
     trace: &mut dyn TraceSink,
-) -> Result<Array4<f32>> {
+) -> Result<Array4<f32>>
+where
+    M: MixSamples + ?Sized,
+{
     stream_split_pass_collect_meta(
         &SplitMeta::from_model(model),
         forward,
@@ -476,17 +426,22 @@ pub fn stream_split_pass_collect<P>(
 }
 
 /// [`stream_split_pass_collect`] with explicit [`SplitMeta`].
-pub fn stream_split_pass_collect_meta<P>(
+pub fn stream_split_pass_collect_meta<P, M>(
     meta: &SplitMeta,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     batch_chunks: usize,
     shift: Option<ShiftView>,
     on_progress: &mut dyn FnMut(usize, usize),
     trace: &mut dyn TraceSink,
-) -> Result<Array4<f32>> {
-    let (batch, channels, mix_length) = mix.dim();
+) -> Result<Array4<f32>>
+where
+    M: MixSamples + ?Sized,
+{
+    let batch = mix.batch();
+    let channels = mix.channels();
+    let mix_length = mix.length();
     let sources = meta.sources;
     let view_length = match shift {
         Some(s) => mix_length + s.max_shift - s.offset,
@@ -522,10 +477,10 @@ pub fn stream_split_pass_collect_meta<P>(
 /// `on_frame(t, frame)` receives original-timeline sample index `t` and a flat
 /// `[b][src][c]` frame (batch is almost always 1). Matches upstream
 /// `apply_model` + caller's `out * std + mean` when `norm` is the Pass-A scan.
-pub fn separate_streaming_normalized<P, F>(
+pub fn separate_streaming_normalized<P, F, M>(
     model: &Htdemucs,
     forward: &dyn SegmentForward<Pending = P>,
-    mix: &Array3<f32>,
+    mix: &M,
     options: SeparateOptions,
     norm: GlobalNorm,
     on_progress: &mut dyn FnMut(usize, usize),
@@ -534,10 +489,12 @@ pub fn separate_streaming_normalized<P, F>(
 ) -> Result<()>
 where
     F: FnMut(usize, &[f32]) -> Result<()>,
+    M: MixSamples + ?Sized,
 {
-    let (batch, _channels, length) = mix.dim();
+    let batch = mix.batch();
+    let length = mix.length();
     let sources = model.config.sources.len();
-    let channels = mix.dim().1;
+    let channels = mix.channels();
     let batch_chunks = std::env::var("DEMUCS_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -692,7 +649,8 @@ mod tests {
 
     use super::*;
     use crate::demucs::host::NoTrace;
-    use crate::demucs::pipeline::{self, SeparateOptions};
+    use crate::demucs::mix::{padded_chunk_mix, padded_chunk_shifted_mix};
+    use crate::demucs::pipeline::{self, padded_chunk, SeparateOptions};
     use ndarray::Array3;
 
     /// Identity forward: echo the mix into every source channel.
@@ -882,7 +840,7 @@ mod tests {
             target,
         )
         .unwrap();
-        let from_virt = padded_chunk_shifted(
+        let from_virt = padded_chunk_shifted_mix(
             &mix, offset, max_shift, length, view_start, chunk_length, target,
         )
         .unwrap();
