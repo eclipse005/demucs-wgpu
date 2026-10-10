@@ -5,7 +5,7 @@
 //! containers (FLAC, MP3) are a separate concern from numerical parity and are
 //! deliberately out of scope for now.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{Error, IoContext, Result};
@@ -33,14 +33,15 @@ impl Audio {
     }
 
     /// Matches the mono-to-stereo expansion in `inference.py`: a single channel
-    /// is duplicated when the config asks for two.
-    pub fn ensure_channels(&self, wanted: usize) -> Result<Audio> {
+    /// is duplicated when the config asks for two. Takes `self` by value so a
+    /// matching layout moves without cloning a full-track plane.
+    pub fn ensure_channels(mut self, wanted: usize) -> Result<Audio> {
         let have = self.channels();
         if have == wanted {
-            return Ok(self.clone());
+            return Ok(self);
         }
         if have == 1 && wanted == 2 {
-            let mono = self.channel(0).to_vec();
+            let mono = std::mem::take(&mut self.data);
             let mut data = Vec::with_capacity(mono.len() * 2);
             data.extend_from_slice(&mono);
             data.extend_from_slice(&mono);
@@ -56,22 +57,61 @@ impl Audio {
     }
 }
 
+/// Header / streaminfo without decoding samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioInfo {
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub frames: usize,
+}
+
+/// Reads container metadata (rate, channels, frame count) without allocating the PCM.
+pub fn probe_audio(path: impl AsRef<Path>) -> Result<AudioInfo> {
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path).with_path(path)?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).with_path(path)?;
+    if magic == *b"fLaC" {
+        // claxon needs a path / fresh reader for streaminfo.
+        let reader = claxon::FlacReader::open(path)
+            .map_err(|e| Error::Audio(format!("{}: {e}", path.display())))?;
+        let info = reader.streaminfo();
+        let frames = info.samples.unwrap_or(0) as usize;
+        return Ok(AudioInfo {
+            sample_rate: info.sample_rate,
+            channels: info.channels as usize,
+            frames,
+        });
+    }
+    file.seek(SeekFrom::Start(0)).with_path(path)?;
+    let header = probe_wav(&mut file).map_err(|e| Error::Audio(format!("{}: {e}", path.display())))?;
+    Ok(header)
+}
+
 /// Reads WAV or FLAC, converting samples to `f32` in the original scale.
+///
+/// Decode writes straight into a channel-major buffer with an O(window)
+/// interleaved scratch — never a full-track interleaved plane plus a second
+/// deinterleaved copy.
 ///
 /// These are the two containers the reference's `sf.write` can produce and the
 /// two that `soundfile` reads without an external decoder, so a FLAC written by
 /// either implementation round-trips through the other.
 pub fn read_audio(path: impl AsRef<Path>) -> Result<Audio> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).with_path(path)?;
-    if bytes.len() >= 4 && &bytes[0..4] == b"fLaC" {
+    let mut file = std::fs::File::open(path).with_path(path)?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).with_path(path)?;
+    if magic == *b"fLaC" {
         return read_flac(path);
     }
-    parse_wav(&bytes).map_err(|e| Error::Audio(format!("{}: {e}", path.display())))
+    file.seek(SeekFrom::Start(0)).with_path(path)?;
+    read_wav_reader(&mut file).map_err(|e| Error::Audio(format!("{}: {e}", path.display())))
 }
 
 /// Reads a FLAC stream through `claxon`, scaling by `2**(bits - 1)` exactly as
-/// `soundfile` does when it hands float samples to `librosa`.
+/// `soundfile` does when it hands float samples to `librosa`. Samples land
+/// directly in channel-major order (no full interleaved Vec).
 pub fn read_flac(path: impl AsRef<Path>) -> Result<Audio> {
     let path = path.as_ref();
     let mut reader = claxon::FlacReader::open(path)
@@ -81,9 +121,40 @@ pub fn read_flac(path: impl AsRef<Path>) -> Result<Audio> {
     if channels == 0 {
         return Err(Error::Audio("zero channels".into()));
     }
-    let samples = info.samples.unwrap_or(0) as usize;
+    let known = info.samples.map(|s| s as usize);
     let scale = 1.0f32 / (1i64 << (info.bits_per_sample - 1)) as f32;
-    let mut interleaved = Vec::with_capacity(samples * channels);
+    // Prefer a sized channel-major buffer; if streaminfo omitted the count,
+    // gather then place (still one plane, not interleaved+deinterleaved).
+    if let Some(frames) = known {
+        let mut data = vec![0.0f32; frames * channels];
+        let mut index = 0usize;
+        for sample in reader.samples() {
+            let value = sample.map_err(|e| Error::Audio(format!("{}: {e}", path.display())))?;
+            if index >= frames * channels {
+                return Err(Error::Audio(format!(
+                    "{}: more samples than streaminfo frames",
+                    path.display()
+                )));
+            }
+            let frame = index / channels;
+            let channel = index % channels;
+            data[channel * frames + frame] = value as f32 * scale;
+            index += 1;
+        }
+        if index != frames * channels {
+            return Err(Error::Audio(format!(
+                "{}: got {index} samples, expected {}",
+                path.display(),
+                frames * channels
+            )));
+        }
+        return Ok(Audio {
+            sample_rate: info.sample_rate,
+            samples: frames,
+            data,
+        });
+    }
+    let mut interleaved = Vec::new();
     for sample in reader.samples() {
         let value = sample.map_err(|e| Error::Audio(format!("{}: {e}", path.display())))?;
         interleaved.push(value as f32 * scale);
@@ -109,108 +180,186 @@ pub fn read_flac(path: impl AsRef<Path>) -> Result<Audio> {
     })
 }
 
-fn parse_wav(bytes: &[u8]) -> Result<Audio> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+/// Bytes of PCM per interleaved frame for a (tag, bits) pair.
+fn wav_bytes_per_frame(channels: usize, bits: u16) -> Result<usize> {
+    let bps = (bits as usize) / 8;
+    if bps == 0 || bits as usize % 8 != 0 {
+        return Err(Error::Audio(format!("unsupported bits per sample {bits}")));
+    }
+    Ok(channels * bps)
+}
+
+fn probe_wav(reader: &mut (impl Read + Seek)) -> Result<AudioInfo> {
+    let (format_tag, channels, sample_rate, bits, data_len, _data_pos) = scan_wav_header(reader)?;
+    let _ = format_tag;
+    let bpf = wav_bytes_per_frame(channels, bits)?;
+    if data_len % bpf != 0 {
+        return Err(Error::Audio(format!(
+            "data chunk of {data_len} bytes is not a whole number of {channels}-channel frames"
+        )));
+    }
+    Ok(AudioInfo {
+        sample_rate,
+        channels,
+        frames: data_len / bpf,
+    })
+}
+
+/// Walk RIFF chunks; on return the reader is positioned at the start of PCM.
+fn scan_wav_header(
+    reader: &mut (impl Read + Seek),
+) -> Result<(u16, usize, u32, u16, usize, u64)> {
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header)?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
         return Err(Error::Audio(
             "not a RIFF/WAVE file (only uncompressed WAV is supported)".into(),
         ));
     }
-
-    let mut pos = 12usize;
-    let mut format: Option<(u16, u16, u32, u16)> = None; // (format, channels, rate, bits)
-    let mut data_range: Option<(usize, usize)> = None;
-
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body_start = pos + 8;
-        let body_end = (body_start + size).min(bytes.len());
+    let mut format: Option<(u16, u16, u32, u16)> = None;
+    let mut data_info: Option<(u64, usize)> = None;
+    loop {
+        let mut chunk_h = [0u8; 8];
+        match reader.read_exact(&mut chunk_h) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(Error::PlainIo(e)),
+        }
+        let id = &chunk_h[0..4];
+        let size = u32::from_le_bytes(chunk_h[4..8].try_into().unwrap()) as usize;
+        let body_pos = reader.stream_position()?;
         if id == b"fmt " {
             if size < 16 {
                 return Err(Error::Audio("truncated fmt chunk".into()));
             }
-            let format_tag = u16::from_le_bytes(bytes[body_start..body_start + 2].try_into().unwrap());
-            let channels = u16::from_le_bytes(bytes[body_start + 2..body_start + 4].try_into().unwrap());
-            let rate = u32::from_le_bytes(bytes[body_start + 4..body_start + 8].try_into().unwrap());
-            let bits = u16::from_le_bytes(bytes[body_start + 14..body_start + 16].try_into().unwrap());
+            let mut fmt = vec![0u8; size];
+            reader.read_exact(&mut fmt)?;
+            let format_tag = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
+            let channels = u16::from_le_bytes(fmt[2..4].try_into().unwrap());
+            let rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
+            let bits = u16::from_le_bytes(fmt[14..16].try_into().unwrap());
             format = Some((format_tag, channels, rate, bits));
         } else if id == b"data" {
-            data_range = Some((body_start, body_end));
+            data_info = Some((body_pos, size));
+            // Do not walk the PCM payload — seek back to it after the header scan.
+            if format.is_some() {
+                break;
+            }
+            reader.seek(SeekFrom::Current(size as i64))?;
+            if size & 1 != 0 {
+                reader.seek(SeekFrom::Current(1))?;
+            }
+            continue;
+        } else {
+            reader.seek(SeekFrom::Current(size as i64))?;
         }
-        // Chunks are word-aligned.
-        pos = body_end + (size & 1);
+        if size & 1 != 0 {
+            reader.seek(SeekFrom::Current(1))?;
+        }
+        if format.is_some() && data_info.is_some() {
+            break;
+        }
     }
-
-    let (format_tag, channels, sample_rate, bits) =
+    let (format_tag, channels_u16, sample_rate, bits) =
         format.ok_or_else(|| Error::Audio("missing fmt chunk".into()))?;
-    let (data_start, data_end) =
-        data_range.ok_or_else(|| Error::Audio("missing data chunk".into()))?;
-    let channels = channels as usize;
+    let (data_pos, data_len) =
+        data_info.ok_or_else(|| Error::Audio("missing data chunk".into()))?;
+    let channels = channels_u16 as usize;
     if channels == 0 {
         return Err(Error::Audio("zero channels".into()));
     }
-    let payload = &bytes[data_start..data_end];
+    reader.seek(SeekFrom::Start(data_pos))?;
+    Ok((format_tag, channels, sample_rate, bits, data_len, data_pos))
+}
 
-    let data: Vec<f32> = match (format_tag, bits) {
-        // WAVE_FORMAT_IEEE_FLOAT
-        (3, 32) => payload
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect(),
-        (3, 64) => payload
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
-            .collect(),
-        // WAVE_FORMAT_PCM
-        (1, 16) => payload
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32 / 32768.0)
-            .collect(),
-        (1, 24) => payload
-            .chunks_exact(3)
-            .map(|c| {
-                let raw = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
+/// Decode one interleaved PCM frame into `out[ch]`.
+fn decode_frame(format_tag: u16, bits: u16, frame: &[u8], channels: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), channels);
+    match (format_tag, bits) {
+        (3, 32) | (0xFFFE, 32) => {
+            for (ch, slot) in out.iter_mut().enumerate() {
+                let o = ch * 4;
+                *slot = f32::from_le_bytes(frame[o..o + 4].try_into().unwrap());
+            }
+        }
+        (3, 64) => {
+            for (ch, slot) in out.iter_mut().enumerate() {
+                let o = ch * 8;
+                *slot = f64::from_le_bytes(frame[o..o + 8].try_into().unwrap()) as f32;
+            }
+        }
+        (1, 16) => {
+            for (ch, slot) in out.iter_mut().enumerate() {
+                let o = ch * 2;
+                *slot = i16::from_le_bytes(frame[o..o + 2].try_into().unwrap()) as f32 / 32768.0;
+            }
+        }
+        (1, 24) => {
+            for (ch, slot) in out.iter_mut().enumerate() {
+                let o = ch * 3;
+                let raw = (frame[o] as i32) | ((frame[o + 1] as i32) << 8) | ((frame[o + 2] as i32) << 16);
                 let signed = (raw << 8) >> 8;
-                signed as f32 / 8_388_608.0
-            })
-            .collect(),
-        (1, 32) => payload
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f32 / 2_147_483_648.0)
-            .collect(),
-        // WAVE_FORMAT_EXTENSIBLE carries the real tag in the sub-format GUID.
-        (0xFFFE, 32) => payload
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect(),
+                *slot = signed as f32 / 8_388_608.0;
+            }
+        }
+        (1, 32) => {
+            for (ch, slot) in out.iter_mut().enumerate() {
+                let o = ch * 4;
+                *slot = i32::from_le_bytes(frame[o..o + 4].try_into().unwrap()) as f32 / 2_147_483_648.0;
+            }
+        }
+        _ => unreachable!("format validated earlier"),
+    }
+}
+
+fn read_wav_reader(reader: &mut (impl Read + Seek)) -> Result<Audio> {
+    let (format_tag, channels, sample_rate, bits, data_len, _data_pos) = scan_wav_header(reader)?;
+    match (format_tag, bits) {
+        (3, 32) | (3, 64) | (1, 16) | (1, 24) | (1, 32) | (0xFFFE, 32) => {}
         (tag, bits) => {
             return Err(Error::Audio(format!(
                 "unsupported WAV format {tag} with {bits} bits per sample"
             )))
         }
-    };
-
-    let samples = data.len() / channels;
-    if data.len() % channels != 0 {
+    }
+    let bpf = wav_bytes_per_frame(channels, bits)?;
+    if data_len % bpf != 0 {
         return Err(Error::Audio(format!(
-            "data chunk of {} samples is not a whole number of {channels}-channel frames",
-            data.len()
+            "data chunk of {data_len} bytes is not a whole number of {channels}-channel frames"
         )));
     }
-
-    // WAV stores interleaved; the pipeline wants channel-major.
-    let mut deinterleaved = vec![0.0f32; data.len()];
-    for frame in 0..samples {
-        for channel in 0..channels {
-            deinterleaved[channel * samples + frame] = data[frame * channels + channel];
+    let frames = data_len / bpf;
+    let mut data = vec![0.0f32; frames * channels];
+    // Windowed interleaved scratch — O(segment), not O(track).
+    const WINDOW_FRAMES: usize = 4096;
+    let mut scratch = vec![0u8; WINDOW_FRAMES * bpf];
+    let mut frame_vals = vec![0.0f32; channels];
+    let mut frame = 0usize;
+    while frame < frames {
+        let n = (frames - frame).min(WINDOW_FRAMES);
+        let bytes = n * bpf;
+        reader.read_exact(&mut scratch[..bytes])?;
+        for i in 0..n {
+            let raw = &scratch[i * bpf..(i + 1) * bpf];
+            decode_frame(format_tag, bits, raw, channels, &mut frame_vals);
+            let t = frame + i;
+            for ch in 0..channels {
+                data[ch * frames + t] = frame_vals[ch];
+            }
         }
+        frame += n;
     }
-
     Ok(Audio {
         sample_rate,
-        samples,
-        data: deinterleaved,
+        samples: frames,
+        data,
     })
+}
+
+/// In-memory WAV parse used by unit tests (same decode path as the file reader).
+fn parse_wav(bytes: &[u8]) -> Result<Audio> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    read_wav_reader(&mut cursor)
 }
 
 /// `sf.write`'s `subtype=` values that the reference's `--pcm_type` can select.
@@ -680,7 +829,7 @@ mod tests {
             samples: 2,
             data: vec![0.5, -0.5],
         };
-        let stereo = audio.ensure_channels(2).unwrap();
+        let stereo = audio.clone().ensure_channels(2).unwrap();
         assert_eq!(stereo.channels(), 2);
         assert_eq!(stereo.channel(0), &[0.5, -0.5]);
         assert_eq!(stereo.channel(1), &[0.5, -0.5]);
@@ -771,6 +920,19 @@ mod tests {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.0, 3.0, 2.0, 4.0], "frames must interleave L,R");
+    }
+
+    #[test]
+    fn probe_audio_matches_decoded_frames() {
+        let dir = std::env::temp_dir().join("demucs-audio-probe-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.wav");
+        write_wav_f32(&path, 8000, 2, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let info = probe_audio(&path).unwrap();
+        let audio = read_audio(&path).unwrap();
+        assert_eq!(info.sample_rate, audio.sample_rate);
+        assert_eq!(info.channels, audio.channels());
+        assert_eq!(info.frames, audio.samples);
     }
 
     #[test]
