@@ -341,24 +341,45 @@ fn separate(args: SeparateArgs) -> Result<()> {
     let load_seconds = load_started.elapsed().as_secs_f64();
     let sample_rate = sep.sample_rate() as u32;
 
-    // Admit before decode allocates the O(T) mix (P0 slope ≈ 20.1 MiB/min).
-    let info = demucs_core::audio::probe_audio(&args.input)
-        .with_context(|| format!("probing {}", args.input.display()))?;
-    sep.admit_for_samples(info.frames)
-        .with_context(|| "memory admit check")?;
-    // One mix buffer — no left/right clones. Streaming OLA flushes frames
-    // straight into FloatWavWriter so peak output RAM stays O(segment).
-    let mut mix = read_mix(&args.input, AUDIO_CHANNELS)?;
-    let audio_seconds = mix.dim().2 as f64 / sep.sample_rate() as f64;
-    let names = sep.sources().to_vec();
-    let n_sources = names.len();
-
     let options = SeparateOptions {
         shifts: args.shifts,
         overlap: args.overlap,
         transition_power: 1.0,
         segment: args.segment,
     };
+
+    // Pass A: O(1) mean/std scan (no resident mix). Admit uses horizontal slope.
+    let (norm, info) = demucs_core::demucs::scan_norm_file(&args.input, AUDIO_CHANNELS)
+        .with_context(|| format!("scanning {}", args.input.display()))?;
+    if info.sample_rate as usize != sep.sample_rate() {
+        bail!(
+            "{} is at {} Hz but the model wants {} Hz",
+            args.input.display(),
+            info.sample_rate,
+            sep.sample_rate()
+        );
+    }
+    sep.admit_for_samples(info.frames)
+        .with_context(|| "memory admit check")?;
+    let audio_seconds = info.frames as f64 / sep.sample_rate() as f64;
+    let names = sep.sources().to_vec();
+    let n_sources = names.len();
+    let segment_seconds = options.segment.unwrap_or(sep.segment());
+    let segment_length = (sep.sample_rate() as f64 * segment_seconds) as usize;
+    let max_shift = if options.shifts > 0 {
+        (0.5 * sep.sample_rate() as f64) as usize
+    } else {
+        0
+    };
+    let cap = demucs_core::demucs::window_cap_for(segment_length, max_shift);
+    // Pass B: O(segment) windowed mix with live norm.
+    let mix = demucs_core::demucs::WindowedMix::open(
+        &args.input,
+        AUDIO_CHANNELS,
+        cap,
+        Some(norm),
+    )
+    .with_context(|| format!("opening {}", args.input.display()))?;
 
     let (selected, companion): (Vec<(usize, String)>, Option<(String, OtherMethod)>) =
         match (&args.stem, &args.two_stems) {
@@ -398,18 +419,12 @@ fn separate(args: SeparateArgs) -> Result<()> {
         }
     };
 
-    // `--other-method minus` needs the original track after in-place normalize.
-    let original_for_minus =
-        if matches!(companion.as_ref().map(|(_, m)| *m), Some(OtherMethod::Minus)) {
-            Some(mix.clone())
-        } else {
-            None
-        };
-
     // dump-trace still goes through the in-memory API (activation dump).
     if let Some(dir) = &args.dump_trace {
-        let left: Vec<f32> = mix.slice(s![0, 0, ..]).iter().copied().collect();
-        let right: Vec<f32> = mix.slice(s![0, 1, ..]).iter().copied().collect();
+        let want_minus = matches!(companion.as_ref().map(|(_, m)| *m), Some(OtherMethod::Minus));
+        let full = read_mix(&args.input, AUDIO_CHANNELS)?;
+        let left: Vec<f32> = full.slice(s![0, 0, ..]).iter().copied().collect();
+        let right: Vec<f32> = full.slice(s![0, 1, ..]).iter().copied().collect();
         let mut tracing = VecTrace::default();
         let started = Instant::now();
         let stems = sep.separate_with_trace(
@@ -430,7 +445,8 @@ fn separate(args: SeparateArgs) -> Result<()> {
             sep.sample_rate(),
             sep.segment(),
         );
-        return write_stems_from_vec(&stems, &mix, &names, &original_for_minus, sample_rate, &args);
+        let original_for_minus = want_minus.then(|| full.clone());
+        return write_stems_from_vec(&stems, &full, &names, &original_for_minus, sample_rate, &args);
     }
 
     let mut stem_writers: Vec<(usize, String, demucs_core::audio::FloatWavWriter)> = Vec::new();
@@ -476,10 +492,12 @@ fn separate(args: SeparateArgs) -> Result<()> {
         let peaks = &mut peaks;
         let stem_writers = &mut stem_writers;
         let companion_writer = &mut companion_writer;
-        let original_for_minus = &original_for_minus;
-        sep.separate_streaming(
-            &mut mix,
+        let mix = &mix;
+        sep.separate_streaming_normalized_mix(
+            mix,
             &options,
+            norm,
+            &mut NoTrace,
             &mut |_| {},
             &mut |t, frame| {
                 for (slot, (src_index, _, writer)) in stem_writers.iter_mut().enumerate() {
@@ -503,10 +521,10 @@ fn separate(args: SeparateArgs) -> Result<()> {
                             [l, r]
                         }
                         OtherMethod::Minus => {
-                            let origin = original_for_minus.as_ref().expect("minus snapshot");
+                            // Raw mix via the same window (pre-norm).
                             [
-                                origin[[0, 0, t]] - frame[*src_index * AUDIO_CHANNELS],
-                                origin[[0, 1, t]] - frame[*src_index * AUDIO_CHANNELS + 1],
+                                mix.raw_at(0, t) - frame[*src_index * AUDIO_CHANNELS],
+                                mix.raw_at(1, t) - frame[*src_index * AUDIO_CHANNELS + 1],
                             ]
                         }
                     };

@@ -29,12 +29,14 @@
 use std::path::Path;
 
 use crate::demucs::host::{Htdemucs, TraceSink};
-use crate::demucs::pipeline::{self, SeparateOptions};
+use crate::demucs::mix::{self, MixSamples, WindowedMix};
+use crate::demucs::pipeline::{self, SegmentForward, SeparateOptions};
 use crate::demucs::weights::LoadedWeights;
 use crate::demucs::host::NoTrace;
 use crate::gpu::{DeviceSelector, Gpu};
 use crate::gpu::htdemucs::GpuHtdemucsRunner;
 use crate::{Error, Result};
+use ndarray::{s, Array3, Array4};
 
 /// Model hyperparameters of the HTDemucs family, reported for callers that want
 /// to size buffers without walking the config.
@@ -260,9 +262,9 @@ impl Engine {
     }
 
     /// Stream normalised frames; with `shifts <= 1` peak output RAM is O(segment).
-    fn separate_emit<F>(
+    fn separate_emit<F, M>(
         &self,
-        mix: &ndarray::Array3<f32>,
+        mix: &M,
         options: SeparateOptions,
         on_progress: &mut dyn FnMut(usize, usize),
         trace: &mut dyn TraceSink,
@@ -270,6 +272,7 @@ impl Engine {
     ) -> Result<()>
     where
         F: FnMut(usize, &[f32]) -> Result<()>,
+        M: MixSamples + ?Sized,
     {
         match &self.runner {
             Some(runner) => pipeline::separate_emit_gpu(
@@ -291,6 +294,79 @@ impl Engine {
                 trace,
             ),
         }
+    }
+
+    /// One segment forward (start+collect), used by bag lockstep combine.
+    fn forward_segment(
+        &self,
+        padded: &Array3<f32>,
+        trace: &mut dyn TraceSink,
+    ) -> Result<Array4<f32>> {
+        match &self.runner {
+            Some(runner) => {
+                let forward = crate::gpu::htdemucs::DeviceForward::new(&self.host, runner);
+                let pending = forward.start(padded, trace)?;
+                forward.collect(pending, trace)
+            }
+            None => self.host.forward(padded, trace),
+        }
+    }
+}
+
+/// Bag lockstep: each segment is forwarded through every needed network, then
+/// weighted and combined before OLA. Linear weights ⇒ bit-exact vs full-buffer
+/// bag average. Peak RAM stays O(segment) for `shifts <= 1`.
+struct BagCombineForward<'a> {
+    bag: &'a [(Engine, Vec<f32>)],
+    requested: Vec<bool>,
+    sources: usize,
+}
+
+impl SegmentForward for BagCombineForward<'_> {
+    type Pending = Array4<f32>;
+
+    fn start(&self, padded: &Array3<f32>, trace: &mut dyn TraceSink) -> Result<Array4<f32>> {
+        let (batch, channels, time) = padded.dim();
+        let mut combined = Array4::<f32>::zeros((batch, self.sources, channels, time));
+        let mut totals = vec![0.0f32; self.sources];
+        for (engine, weights) in self.bag {
+            let needed = weights.iter().enumerate().any(|(s, w)| {
+                *w != 0.0 && self.requested.get(s).copied().unwrap_or(false)
+            });
+            if !needed {
+                continue;
+            }
+            let out = engine.forward_segment(padded, trace)?;
+            for (source, weight) in weights.iter().enumerate() {
+                if *weight == 0.0 || !self.requested.get(source).copied().unwrap_or(false) {
+                    continue;
+                }
+                let mut lane = out.slice(s![.., source, .., ..]).to_owned();
+                lane.mapv_inplace(|v| v * *weight);
+                combined
+                    .slice_mut(s![.., source, .., ..])
+                    .zip_mut_with(&lane, |a, b| *a += *b);
+                totals[source] += *weight;
+            }
+        }
+        for (source, total) in totals.iter().enumerate() {
+            if !self.requested.get(source).copied().unwrap_or(false) {
+                continue;
+            }
+            if *total == 0.0 {
+                return Err(Error::Shape(format!(
+                    "no network covers stem index {source}"
+                )));
+            }
+            combined
+                .slice_mut(s![.., source, .., ..])
+                .mapv_inplace(|v| v / total);
+        }
+        Ok(combined)
+    }
+
+    fn collect(&self, pending: Array4<f32>, _trace: &mut dyn TraceSink) -> Result<Array4<f32>> {
+        Ok(pending)
     }
 }
 
@@ -458,14 +534,14 @@ impl Demucs {
         // Two-pass global norm matching upstream `Separator.separate_tensor`.
         let norm = crate::demucs::streaming::scan_norm(mix);
         crate::demucs::streaming::apply_norm_inplace(mix, norm);
-        // Single-network + shifts<=1: fill stem buffers from the emit path so we
-        // never hold a full Array4. Bag / shifts>1 still go through collect.
-        if matches!(self.inner, Inner::Single(_)) && options.shifts <= 1 {
-            return self.collect_stems_streaming(mix, options, norm, trace, on_progress);
+        // Streaming emit for Single and bag when shifts<=1 (and for shifts>1 the
+        // emit path still avoids a second Array4 beyond the shift accumulator).
+        // Prefer emit for all common paths.
+        if options.shifts <= 1 || matches!(self.inner, Inner::Single(_)) {
+            return self.collect_stems_from_mix(mix, options, norm, trace, on_progress);
         }
-        let mut sources = self.collect(mix, options, trace, on_progress)?;
-        pipeline::denormalize(&mut sources, norm);
-        Ok(self.stems_from_array(sources))
+        // Bag + shifts>1: collect still works; emit also works via bag lockstep.
+        self.collect_stems_from_mix(mix, options, norm, trace, on_progress)
     }
 
     /// Stream denormalised frames into pre-sized stem `Vec`s (Single, shifts<=1).
@@ -477,12 +553,19 @@ impl Demucs {
         trace: &mut dyn TraceSink,
         on_progress: &mut dyn FnMut(SeparationProgress),
     ) -> Result<Vec<Stem>> {
-        let Inner::Single(engine) = &self.inner else {
-            unreachable!("collect_stems_streaming is Single-only");
-        };
-        let names = engine.host.config.sources.clone();
-        let samples = mix.dim().2;
-        let sources = names.len();
+        self.collect_stems_from_mix(mix, options, norm, trace, on_progress)
+    }
+
+    fn collect_stems_from_mix<M: MixSamples + ?Sized>(
+        &self,
+        mix: &M,
+        options: &SeparateOptions,
+        norm: pipeline::GlobalNorm,
+        trace: &mut dyn TraceSink,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> Result<Vec<Stem>> {
+        let names = self.sources().to_vec();
+        let samples = mix.length();
         let wanted = |id: StemId| match &self.selection {
             StemSelection::All => true,
             StemSelection::Some(list) => list.contains(&id),
@@ -497,23 +580,20 @@ impl Demucs {
                 Some((id, vec![0.0f32; samples], vec![0.0f32; samples]))
             })
             .collect();
-        // Still O(T) for the returned stems (API contract), but one copy — not
-        // Array4 + denorm + to_vec.
-        engine.separate_emit(
+        self.separate_streaming_normalized_mix(
             mix,
-            *options,
-            &mut |done, total| on_progress(SeparationProgress { done, total }),
+            options,
+            norm,
             trace,
+            on_progress,
             &mut |t, frame| {
-                // frame: [b=0][src][c] with batch 1
                 for (src, lane) in lanes.iter_mut().enumerate() {
                     if let Some((_, left, right)) = lane.as_mut() {
                         let base = src * AUDIO_CHANNELS;
-                        left[t] = frame[base] * norm.std + norm.mean;
-                        right[t] = frame[base + 1] * norm.std + norm.mean;
+                        left[t] = frame[base];
+                        right[t] = frame[base + 1];
                     }
                 }
-                let _ = sources;
                 Ok(())
             },
         )?;
@@ -526,10 +606,14 @@ impl Demucs {
 
     /// Stream denormalised frames to a callback without retaining stem `Vec`s.
     ///
-    /// With a single network and `shifts <= 1`, peak output RAM is O(segment)
-    /// (OLA rings + the writer's buffer). `mix` is normalised in place.
+    /// For Single and bag (`htdemucs_ft`) with `shifts <= 1`, peak output RAM is
+    /// O(segment) (OLA rings + the writer's buffer). `mix` is normalised in place.
     /// `on_frame(t, frame)` receives a flat `[src][ch]` denormalised frame
-    /// (batch is 1). Bag models fall back to materialising then replaying.
+    /// (batch is 1).
+    ///
+    /// For `shifts > 1` an O(T) shift accumulator is required (quality needs the
+    /// average of every pass); OLA rings stay O(segment) and frames are still
+    /// emitted in order without a second full Array4.
     pub fn separate_streaming<F>(
         &self,
         mix: &mut ndarray::Array3<f32>,
@@ -563,37 +647,139 @@ impl Demucs {
         self.admit_for_samples(mix.dim().2)?;
         let norm = crate::demucs::streaming::scan_norm(mix);
         crate::demucs::streaming::apply_norm_inplace(mix, norm);
+        self.separate_streaming_normalized_mix(mix, options, norm, trace, on_progress, on_frame)
+    }
+
+    /// Two-pass file path: Pass A scans mean/std in O(1); Pass B windows the mix
+    /// so peak input RAM is O(segment). Same emit semantics as
+    /// [`Self::separate_streaming`].
+    pub fn separate_streaming_file<F>(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        options: &SeparateOptions,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+        on_frame: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+    {
+        let path = path.as_ref();
+        let rate = self.sample_rate();
+        let (norm, info) = mix::scan_norm_file(path, AUDIO_CHANNELS)?;
+        if info.sample_rate as usize != rate {
+            return Err(Error::Shape(format!(
+                "{} is at {} Hz but the model wants {rate} Hz",
+                path.display(),
+                info.sample_rate
+            )));
+        }
+        self.admit_for_samples(info.frames)?;
+        let segment_seconds = options.segment.unwrap_or(self.segment());
+        let segment_length = (rate as f64 * segment_seconds) as usize;
+        let max_shift = if options.shifts > 0 {
+            (0.5 * rate as f64) as usize
+        } else {
+            0
+        };
+        let cap = mix::window_cap_for(segment_length, max_shift);
+        let windowed = WindowedMix::open(path, AUDIO_CHANNELS, cap, Some(norm))?;
+        self.separate_streaming_normalized_mix(
+            &windowed,
+            options,
+            norm,
+            &mut NoTrace,
+            on_progress,
+            on_frame,
+        )
+    }
+
+    /// Emit from an already-normalised [`MixSamples`] (Array3 or WindowedMix).
+    pub fn separate_streaming_normalized_mix<F, M>(
+        &self,
+        mix: &M,
+        options: &SeparateOptions,
+        norm: pipeline::GlobalNorm,
+        trace: &mut dyn TraceSink,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+        on_frame: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+        M: MixSamples + ?Sized,
+    {
+        if mix.batch() != 1 || mix.channels() != AUDIO_CHANNELS {
+            return Err(Error::Shape(format!(
+                "mix must be (1, {AUDIO_CHANNELS}, samples), got ({}, {}, {})",
+                mix.batch(),
+                mix.channels(),
+                mix.length()
+            )));
+        }
         let sources = self.sources().len();
         let mut scratch = vec![0.0f32; sources * AUDIO_CHANNELS];
+        let denorm = |frame: &[f32], scratch: &mut [f32]| {
+            for i in 0..scratch.len() {
+                scratch[i] = frame[i] * norm.std + norm.mean;
+            }
+        };
 
         match &self.inner {
-            Inner::Single(engine) if options.shifts <= 1 => {
-                engine.separate_emit(
+            Inner::Single(engine) => engine.separate_emit(
+                mix,
+                *options,
+                &mut |done, total| on_progress(SeparationProgress { done, total }),
+                trace,
+                &mut |t, frame| {
+                    denorm(frame, &mut scratch);
+                    on_frame(t, &scratch)
+                },
+            ),
+            Inner::Bag(bag) => {
+                let names = &bag[0].0.host.config.sources;
+                let requested: Vec<bool> = names
+                    .iter()
+                    .map(|name| match &self.selection {
+                        StemSelection::All => true,
+                        StemSelection::Some(list) => {
+                            StemId::parse(name).is_some_and(|id| list.contains(&id))
+                        }
+                    })
+                    .collect();
+                let forward = BagCombineForward {
+                    bag,
+                    requested,
+                    sources: names.len(),
+                };
+                // Progress: one pass schedule times number of active networks
+                // (matches collect()'s accounting).
+                let active = bag
+                    .iter()
+                    .filter(|(_, w)| {
+                        w.iter().enumerate().any(|(s, weight)| {
+                            *weight != 0.0 && forward.requested.get(s).copied().unwrap_or(false)
+                        })
+                    })
+                    .count()
+                    .max(1);
+                let model = &bag[0].0.host;
+                pipeline::separate_forwarding_emit(
+                    model,
+                    &forward,
                     mix,
                     *options,
-                    &mut |done, total| on_progress(SeparationProgress { done, total }),
-                    trace,
+                    &mut |done, total| {
+                        // Scale progress by active nets so totals match collect().
+                        on_progress(SeparationProgress {
+                            done: done * active,
+                            total: total * active,
+                        })
+                    },
                     &mut |t, frame| {
-                        for i in 0..scratch.len() {
-                            scratch[i] = frame[i] * norm.std + norm.mean;
-                        }
+                        denorm(frame, &mut scratch);
                         on_frame(t, &scratch)
                     },
+                    trace,
                 )
-            }
-            _ => {
-                // Bag or shifts>1: collect, denorm, replay in order.
-                let mut array = self.collect(mix, options, trace, on_progress)?;
-                pipeline::denormalize(&mut array, norm);
-                let length = array.dim().3;
-                for t in 0..length {
-                    for src in 0..sources {
-                        scratch[src * AUDIO_CHANNELS] = array[[0, src, 0, t]];
-                        scratch[src * AUDIO_CHANNELS + 1] = array[[0, src, 1, t]];
-                    }
-                    on_frame(t, &scratch)?;
-                }
-                Ok(())
             }
         }
     }
@@ -608,8 +794,7 @@ impl Demucs {
     ) -> Result<Vec<Stem>> {
         let path = path.as_ref();
         let rate = self.sample_rate();
-        // Probe duration first so the admit check can refuse before decode allocates.
-        let info = crate::audio::probe_audio(path)?;
+        let (norm, info) = mix::scan_norm_file(path, AUDIO_CHANNELS)?;
         if info.sample_rate as usize != rate {
             return Err(Error::Shape(format!(
                 "{} is at {} Hz but the model wants {rate} Hz",
@@ -617,15 +802,19 @@ impl Demucs {
                 info.sample_rate
             )));
         }
-        let frames = info.frames;
-        self.admit_for_samples(frames)?;
-        let audio = crate::audio::read_audio(path)?;
-        let audio = audio.ensure_channels(AUDIO_CHANNELS)?;
-        let samples = audio.samples;
-        let channels = audio.channels();
-        let mut mix = ndarray::Array3::from_shape_vec((1, channels, samples), audio.data)
-            .map_err(|e| Error::Shape(e.to_string()))?;
-        self.separate_mix(&mut mix, &SeparateOptions::default(), on_progress)
+        self.admit_for_samples(info.frames)?;
+        let options = SeparateOptions::default();
+        let segment_seconds = options.segment.unwrap_or(self.segment());
+        let segment_length = (rate as f64 * segment_seconds) as usize;
+        let max_shift = if options.shifts > 0 {
+            (0.5 * rate as f64) as usize
+        } else {
+            0
+        };
+        let cap = mix::window_cap_for(segment_length, max_shift);
+        let windowed = WindowedMix::open(path, AUDIO_CHANNELS, cap, Some(norm))?;
+        // Stem Vecs are still O(T) (API contract); input mix is O(segment).
+        self.collect_stems_from_mix(&windowed, &options, norm, &mut NoTrace, on_progress)
     }
 
     /// Which backend this handle actually runs on.
@@ -674,7 +863,7 @@ impl Demucs {
         }
     }
 
-    /// Refuse before allocating O(T) buffers when the P0 slope estimate will not fit.
+    /// Refuse when the host RAM slope estimate (near-horizontal after unbounded opt) will not fit.
     pub fn admit_for_samples(&self, samples: usize) -> Result<()> {
         let rate = self.sample_rate().max(1) as f64;
         let duration = samples as f64 / rate;

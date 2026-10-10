@@ -1,25 +1,27 @@
 //! Host RAM admit check before separation.
 //!
-//! After P0 streaming OLA, peak RSS still scales with the input mix
-//! (~20.1 MiB/min ≈ 2.0 full-track f32 channel planes at 44.1 kHz). Call
-//! [`admit_separation`] before allocating the mix / running separate so a
-//! long track returns a clear error instead of being killed by the OS.
-//!
-//! Override the slope with `DEMUCS_MEM_SLOPE` (MiB/min, must be > 0) when
-//! measuring on another machine; invalid/missing values keep the built-in
-//! constant so admit stays conservative-safe.
+//! After the unbounded (two-pass windowed mix + streaming OLA) path, peak host
+//! RSS for common cases (Single or bag, `shifts <= 1`) is essentially
+//! **horizontal**: O(segment) rings / windows + model working set — not O(T).
+//! The built-in slope is therefore ~0; admit still guards model WS vs available
+//! RAM. Override with `DEMUCS_MEM_SLOPE` (MiB/min, must be > 0) when measuring
+//! a machine that still shows residual growth (e.g. `shifts > 1` accumulator).
 
 use crate::error::{Error, Result};
 
-/// Measured post-P0 host RSS slope (MiB wall-clock minute of mix @ 44.1 kHz).
-pub const SLOPE_MIB_PER_MIN: f64 = 20.1;
+/// Measured post-unbounded host RSS slope (MiB wall-clock minute of mix @ 44.1 kHz).
+///
+/// Horizontal for the streaming file path (`shifts <= 1`): no resident full mix
+/// or full Array4. Kept as a tiny epsilon so estimate_peak_bytes still grows
+/// slightly under absurd durations rather than staying flat forever.
+pub const SLOPE_MIB_PER_MIN: f64 = 0.05;
 
 /// Default fraction of available RAM the estimate may consume.
 pub const DEFAULT_RAM_FRACTION: f64 = 0.75;
 
-/// Activation / arena / OLA ring budget that does not scale with duration.
-/// Covers a 7.8 s segment forward plus host caches; weights are counted
-/// separately via [`model_working_set_bytes`].
+/// Activation / arena / OLA ring / Pass-B window budget that does not scale with
+/// duration. Covers a 7.8 s segment forward plus host caches; weights are
+/// counted separately via [`model_working_set_bytes`].
 const ACTIVATION_BUDGET_BYTES: u64 = 768 << 20;
 
 /// Bytes for model weights (`parameter_count` f32s) plus a fixed activation budget.
@@ -118,7 +120,7 @@ fn available_ram_windows() -> Option<u64> {
     }
 }
 
-/// Reject the run when the P0 slope estimate exceeds `ram_fraction()` of available RAM.
+/// Reject the run when the slope estimate exceeds `ram_fraction()` of available RAM.
 ///
 /// When available RAM cannot be queried, the check is skipped (no false refusal).
 pub fn admit_separation(duration_secs: f64, model_ws_bytes: u64) -> Result<()> {
@@ -159,18 +161,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slope_matches_p0_two_hour_ballpark() {
-        // 120 min * 20.1 = 2412 MiB of slope alone (built-in constant).
+    fn slope_is_near_horizontal_for_two_hours() {
+        // 120 min * 0.05 ≈ 6 MiB of slope alone (built-in constant).
         let minutes = 120.0;
         let expected = SLOPE_MIB_PER_MIN * minutes;
         let slope_bytes = (SLOPE_MIB_PER_MIN * minutes * 1024.0 * 1024.0).ceil() as u64;
         let mib = slope_bytes as f64 / (1024.0 * 1024.0);
-        assert!((mib - expected).abs() < 2.0, "got {mib}");
-        // estimate_peak_bytes uses the env-aware slope; when unset it matches.
+        assert!((mib - expected).abs() < 1.0, "got {mib}");
         if std::env::var_os("DEMUCS_MEM_SLOPE").is_none() {
             let est = estimate_peak_bytes(7200.0, 0);
             let est_mib = est as f64 / (1024.0 * 1024.0);
-            assert!((est_mib - 2412.0).abs() < 2.0, "got {est_mib}");
+            assert!(est_mib < 10.0, "expected near-horizontal, got {est_mib}");
         }
     }
 
