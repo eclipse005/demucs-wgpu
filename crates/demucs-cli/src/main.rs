@@ -26,7 +26,7 @@ use demucs_core::demucs::{load_weights, HtdemucsWeights};
 use demucs_core::{
     paths, Backend, Demucs, LoadOptions, ModelVariant, StemId, StemSelection, AUDIO_CHANNELS,
 };
-use ndarray::{s, Array1, Array3};
+use ndarray::{s, Array3};
 
 /// The bare `--model htdemucs` / `htdemucs_ft` names resolve to the standard
 /// cache locations via `demucs_core::paths` — no developer machine path is
@@ -341,12 +341,12 @@ fn separate(args: SeparateArgs) -> Result<()> {
     let load_seconds = load_started.elapsed().as_secs_f64();
     let sample_rate = sep.sample_rate() as u32;
 
-    // `read_mix` keeps the raw track around for `--other-method minus`; the
-    // facade normalises internally so the CLI no longer touches that step.
-    let mix = read_mix(&args.input, AUDIO_CHANNELS)?;
+    // One mix buffer — no left/right clones. Streaming OLA flushes frames
+    // straight into FloatWavWriter so peak output RAM stays O(segment).
+    let mut mix = read_mix(&args.input, AUDIO_CHANNELS)?;
     let audio_seconds = mix.dim().2 as f64 / sep.sample_rate() as f64;
-    let left = mix.slice(s![0, 0, ..]).to_vec();
-    let right = mix.slice(s![0, 1, ..]).to_vec();
+    let names = sep.sources().to_vec();
+    let n_sources = names.len();
 
     let options = SeparateOptions {
         shifts: args.shifts,
@@ -355,10 +355,59 @@ fn separate(args: SeparateArgs) -> Result<()> {
         segment: args.segment,
     };
 
-    let mut tracing = VecTrace::default();
-    let started = Instant::now();
-    let stems = if let Some(dir) = &args.dump_trace {
-        let out = sep.separate_with_trace(
+    let (selected, companion): (Vec<(usize, String)>, Option<(String, OtherMethod)>) =
+        match (&args.stem, &args.two_stems) {
+            (Some(stem), _) | (None, Some(stem)) => {
+                let index = names.iter().position(|name| name == stem).ok_or_else(|| {
+                    anyhow::anyhow!("--two-stems must be one of {:?}, got {stem:?}", names)
+                })?;
+                let method = if args.two_stems.is_some() {
+                    args.other_method
+                } else {
+                    OtherMethod::None
+                };
+                (
+                    vec![(index, stem.clone())],
+                    (method != OtherMethod::None).then_some((stem.clone(), method)),
+                )
+            }
+            (None, None) => (
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (index, name.clone()))
+                    .collect(),
+                None,
+            ),
+        };
+
+    let single_file = companion.is_none() && args.output.extension().is_some();
+    if !single_file {
+        std::fs::create_dir_all(&args.output).ok();
+    }
+    let path_for = |name: &str| -> PathBuf {
+        if single_file {
+            args.output.clone()
+        } else {
+            args.output.join(format!("{name}.wav"))
+        }
+    };
+
+    // `--other-method minus` needs the original track after in-place normalize.
+    let original_for_minus =
+        if matches!(companion.as_ref().map(|(_, m)| *m), Some(OtherMethod::Minus)) {
+            Some(mix.clone())
+        } else {
+            None
+        };
+
+    // dump-trace still goes through the in-memory API (activation dump).
+    if let Some(dir) = &args.dump_trace {
+        let left: Vec<f32> = mix.slice(s![0, 0, ..]).iter().copied().collect();
+        let right: Vec<f32> = mix.slice(s![0, 1, ..]).iter().copied().collect();
+        let mut tracing = VecTrace::default();
+        let started = Instant::now();
+        let stems = sep.separate_with_trace(
             &left,
             &right,
             sample_rate,
@@ -366,30 +415,130 @@ fn separate(args: SeparateArgs) -> Result<()> {
             &mut tracing,
             &mut |_| {},
         )?;
+        let elapsed = started.elapsed().as_secs_f64();
         write_trace(dir, &tracing)?;
-        out
-    } else {
-        sep.separate_with_options(&left, &right, sample_rate, &options, &mut |_| {})?
-    };
-    let elapsed = started.elapsed().as_secs_f64();
+        report(
+            audio_seconds,
+            elapsed,
+            load_seconds,
+            args.timings,
+            sep.sample_rate(),
+            sep.segment(),
+        );
+        return write_stems_from_vec(&stems, &mix, &names, &original_for_minus, sample_rate, &args);
+    }
 
-    // Lay the returned stems back down in config-source order for the writers,
-    // leaving unselected lanes zero (they are only read for a companion, and
-    // those runs load all four stems).
-    let names = sep.sources().to_vec();
-    let samples = left.len();
-    let mut sources = ndarray::Array4::<f32>::zeros((1, names.len(), AUDIO_CHANNELS, samples));
-    for stem in &stems {
-        let index = names
+    let mut stem_writers: Vec<(usize, String, demucs_core::audio::FloatWavWriter)> = Vec::new();
+    for (index, name) in &selected {
+        let w = demucs_core::audio::FloatWavWriter::create(
+            path_for(name),
+            sample_rate,
+            AUDIO_CHANNELS,
+        )?;
+        stem_writers.push((*index, name.clone(), w));
+    }
+    let mut companion_writer: Option<(OtherMethod, usize, String, demucs_core::audio::FloatWavWriter)> =
+        None;
+    if let Some((stem, method)) = &companion {
+        let name = match method {
+            OtherMethod::Add => format!("no_{stem}"),
+            OtherMethod::Minus => format!("minus_{stem}"),
+            OtherMethod::None => unreachable!(),
+        };
+        let index = selected[0].0;
+        let w = demucs_core::audio::FloatWavWriter::create(
+            path_for(&name),
+            sample_rate,
+            AUDIO_CHANNELS,
+        )?;
+        companion_writer = Some((*method, index, name, w));
+    }
+
+    let mem_log = std::env::var_os("DEMUCS_MEM").is_some();
+    if mem_log {
+        eprintln!("DEMUCS_MEM before separate: {}", rss_mib());
+    }
+    let started = Instant::now();
+    let mut peaks: Vec<(String, f32)> = stem_writers
+        .iter()
+        .map(|(_, name, _)| (name.clone(), 0.0f32))
+        .collect();
+    if let Some((_, _, name, _)) = &companion_writer {
+        peaks.push((name.clone(), 0.0));
+    }
+
+    {
+        let peaks = &mut peaks;
+        let stem_writers = &mut stem_writers;
+        let companion_writer = &mut companion_writer;
+        let original_for_minus = &original_for_minus;
+        sep.separate_streaming(
+            &mut mix,
+            &options,
+            &mut |_| {},
+            &mut |t, frame| {
+                for (slot, (src_index, _, writer)) in stem_writers.iter_mut().enumerate() {
+                    let base = *src_index * AUDIO_CHANNELS;
+                    let lr = [frame[base], frame[base + 1]];
+                    peaks[slot].1 = peaks[slot].1.max(lr[0].abs()).max(lr[1].abs());
+                    writer.write_frame(&lr)?;
+                }
+                if let Some((method, src_index, _, writer)) = companion_writer.as_mut() {
+                    let lr = match *method {
+                        OtherMethod::None => unreachable!(),
+                        OtherMethod::Add => {
+                            let mut l = 0.0f32;
+                            let mut r = 0.0f32;
+                            for src in 0..n_sources {
+                                if src != *src_index {
+                                    l += frame[src * AUDIO_CHANNELS];
+                                    r += frame[src * AUDIO_CHANNELS + 1];
+                                }
+                            }
+                            [l, r]
+                        }
+                        OtherMethod::Minus => {
+                            let origin = original_for_minus.as_ref().expect("minus snapshot");
+                            [
+                                origin[[0, 0, t]] - frame[*src_index * AUDIO_CHANNELS],
+                                origin[[0, 1, t]] - frame[*src_index * AUDIO_CHANNELS + 1],
+                            ]
+                        }
+                    };
+                    let slot = peaks.len() - 1;
+                    peaks[slot].1 = peaks[slot].1.max(lr[0].abs()).max(lr[1].abs());
+                    writer.write_frame(&lr)?;
+                }
+                Ok(())
+            },
+        )
+        .with_context(|| "streaming separation")?;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    if mem_log {
+        eprintln!("DEMUCS_MEM after separate: {}", rss_mib());
+    }
+
+    let mut written = Vec::new();
+    for (_, name, writer) in stem_writers {
+        let path = path_for(&name);
+        writer.finish()?;
+        let peak = peaks
             .iter()
-            .position(|name| name == stem.id.as_str())
-            .expect("the facade returned a stem the config does not name");
-        sources
-            .slice_mut(s![0, index, 0, ..])
-            .assign(&Array1::from(stem.left.clone()));
-        sources
-            .slice_mut(s![0, index, 1, ..])
-            .assign(&Array1::from(stem.right.clone()));
+            .find(|(n, _)| n == &name)
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+        written.push(format!("{} (peak {peak:.4})", path.display()));
+    }
+    if let Some((_, _, name, writer)) = companion_writer {
+        let path = path_for(&name);
+        writer.finish()?;
+        let peak = peaks
+            .iter()
+            .find(|(n, _)| n == &name)
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+        written.push(format!("{} (peak {peak:.4})", path.display()));
     }
 
     report(
@@ -400,7 +549,8 @@ fn separate(args: SeparateArgs) -> Result<()> {
         sep.sample_rate(),
         sep.segment(),
     );
-    write_stems(&sources, &mix, &names, sep.sample_rate(), &args)
+    println!("wrote {}", written.join(", "));
+    Ok(())
 }
 
 fn report(
@@ -415,8 +565,7 @@ fn report(
     let stride = ((1.0 - 0.25) * segment_length as f64) as usize;
     let chunks = audio_seconds * samplerate as f64 / stride as f64;
     println!(
-        "separation {elapsed:.2}s for {audio_seconds:.3}s -> RTFx {:.2}x | + {load_seconds:.2}s load = \
-         end-to-end RTFx {:.2}x",
+        "separation {elapsed:.2}s for {audio_seconds:.3}s -> RTFx {:.2}x | + {load_seconds:.2}s load =          end-to-end RTFx {:.2}x",
         audio_seconds / elapsed,
         audio_seconds / (elapsed + load_seconds)
     );
@@ -429,29 +578,43 @@ fn report(
     }
 }
 
-/// Writes the requested stems. `mix` is the track as read (only `--other-method
-/// minus` needs it), `sources` the model output in config order, `source_names`
-/// the config's source list, `samplerate` the model's rate.
-fn write_stems(
-    sources: &ndarray::Array4<f32>,
+fn rss_mib() -> String {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return "rss=?".into();
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            return format!("rss={:.1} MiB", kb as f64 / 1024.0);
+        }
+    }
+    "rss=?".into()
+}
+
+/// dump-trace fallback: write from in-memory stems (short runs only).
+fn write_stems_from_vec(
+    stems: &[demucs_core::Stem],
     mix: &Array3<f32>,
     source_names: &[String],
-    samplerate: usize,
+    original_for_minus: &Option<Array3<f32>>,
+    sample_rate: u32,
     args: &SeparateArgs,
 ) -> Result<()> {
-    let (_, count, channels, samples) = sources.dim();
-    // The stem actually written, plus the companion the reference's two-stem
-    // mode derives from the others. `--stem` is the ASR shorthand: it writes
-    // only the named stem, which is the reference's `--other-method none`.
+    let channels = AUDIO_CHANNELS;
+    let samples = mix.dim().2;
     let (selected, companion): (Vec<(usize, String)>, Option<(String, OtherMethod)>) =
         match (&args.stem, &args.two_stems) {
             (Some(stem), _) | (None, Some(stem)) => {
-                let index = source_names.iter().position(|name| name == stem).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--two-stems must be one of {:?}, got {stem:?}",
-                        source_names
-                    )
-                })?;
+                let index = source_names
+                    .iter()
+                    .position(|name| name == stem)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--two-stems must be one of {:?}, got {stem:?}", source_names)
+                    })?;
                 let method = if args.two_stems.is_some() {
                     args.other_method
                 } else {
@@ -463,65 +626,82 @@ fn write_stems(
                 )
             }
             (None, None) => (
-                source_names.iter().enumerate().map(|(index, name)| (index, name.clone())).collect(),
+                source_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (index, name.clone()))
+                    .collect(),
                 None,
             ),
         };
-    if selected.iter().any(|(index, _)| *index >= count) {
-        bail!("the model produced {count} stems but the config names {} sources", source_names.len());
-    }
-
-    // A single output may go straight to a `.wav` path; anything with a
-    // companion lands in a directory next to it, as the reference does.
     let single_file = companion.is_none() && args.output.extension().is_some();
+    if !single_file {
+        std::fs::create_dir_all(&args.output).ok();
+    }
     let mut written = Vec::new();
-    let mut save = |name: &str, data: &[f32]| -> Result<()> {
+    let mut save = |name: &str, left: &[f32], right: &[f32]| -> Result<()> {
         let path = if single_file {
             args.output.clone()
         } else {
-            std::fs::create_dir_all(&args.output).ok();
             args.output.join(format!("{name}.wav"))
         };
-        demucs_core::audio::write_wav_f32(&path, samplerate as u32, channels, data)?;
-        let peak = data.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let mut w = demucs_core::audio::FloatWavWriter::create(&path, sample_rate, channels)?;
+        let mut peak = 0.0f32;
+        for t in 0..left.len() {
+            peak = peak.max(left[t].abs()).max(right[t].abs());
+            w.write_frame(&[left[t], right[t]])?;
+        }
+        w.finish()?;
         written.push(format!("{} (peak {peak:.4})", path.display()));
         Ok(())
     };
-
     for (index, name) in &selected {
-        let data: Vec<f32> = sources.slice(ndarray::s![0, *index, .., ..]).iter().copied().collect();
-        save(name, &data)?;
+        let stem = stems
+            .iter()
+            .find(|s| s.id.as_str() == name.as_str())
+            .or_else(|| {
+                stems
+                    .iter()
+                    .find(|s| source_names.get(*index).map(|n| n.as_str()) == Some(s.id.as_str()))
+            });
+        let Some(stem) = stem else {
+            bail!("missing stem {name}");
+        };
+        save(name, &stem.left, &stem.right)?;
     }
-    if let Some((stem, method)) = companion {
-        let index = selected[0].0;
+    if let Some((stem_name, method)) = companion {
+        let _index = selected[0].0;
+        let primary = stems
+            .iter()
+            .find(|s| s.id.as_str() == stem_name)
+            .ok_or_else(|| anyhow::anyhow!("missing stem {stem_name}"))?;
         match method {
             OtherMethod::None => {}
             OtherMethod::Add => {
-                // Sum every other stem: the reference's `no_<stem>`.
-                let mut summed = ndarray::Array2::<f32>::zeros((channels, samples));
-                for (other, _) in source_names.iter().enumerate() {
-                    if other != index {
-                        summed += &sources.slice(ndarray::s![0, other, .., ..]);
+                let mut left = vec![0.0f32; samples];
+                let mut right = vec![0.0f32; samples];
+                for other in stems {
+                    if other.id.as_str() == stem_name {
+                        continue;
+                    }
+                    for t in 0..samples {
+                        left[t] += other.left[t];
+                        right[t] += other.right[t];
                     }
                 }
-                let data: Vec<f32> = summed.iter().copied().collect();
-                save(&format!("no_{stem}"), &data)?;
+                save(&format!("no_{stem_name}"), &left, &right)?;
             }
             OtherMethod::Minus => {
-                // The original track minus the stem: the reference's `minus_<stem>`.
-                if mix.dim() != (1, channels, samples) {
-                    bail!(
-                        "the track is {:?} but the model output is (1, {channels}, {samples}); \
-                         --other-method minus needs the original track's shape",
-                        mix.dim()
-                    );
+                let origin = original_for_minus
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("minus needs the original mix"))?;
+                let mut left = vec![0.0f32; samples];
+                let mut right = vec![0.0f32; samples];
+                for t in 0..samples {
+                    left[t] = origin[[0, 0, t]] - primary.left[t];
+                    right[t] = origin[[0, 1, t]] - primary.right[t];
                 }
-                let mut data: Vec<f32> = sources.slice(ndarray::s![0, index, .., ..]).iter().copied().collect();
-                let origin: Vec<f32> = mix.iter().copied().collect();
-                for (value, base) in data.iter_mut().zip(origin.iter()) {
-                    *value = base - *value;
-                }
-                save(&format!("minus_{stem}"), &data)?;
+                save(&format!("minus_{stem_name}"), &left, &right)?;
             }
         }
     }

@@ -274,8 +274,61 @@ pub fn separate_with_progress(
     )
 }
 
+/// Host-path streaming emit (no full Array4 when `shifts <= 1`).
+pub fn separate_emit_host<F>(
+    model: &Htdemucs,
+    forward: &dyn Fn(&Array3<f32>, &mut dyn TraceSink) -> Result<Array4<f32>>,
+    mix: &Array3<f32>,
+    options: SeparateOptions,
+    on_progress: &mut dyn FnMut(usize, usize),
+    on_frame: &mut F,
+    trace: &mut dyn TraceSink,
+) -> Result<()>
+where
+    F: FnMut(usize, &[f32]) -> Result<()>,
+{
+    separate_forwarding_emit(
+        model,
+        &Immediate::new(forward),
+        mix,
+        options,
+        on_progress,
+        on_frame,
+        trace,
+    )
+}
+
+/// GPU-path streaming emit (no full Array4 when `shifts <= 1`).
+pub fn separate_emit_gpu<F>(
+    model: &Htdemucs,
+    runner: &crate::gpu::htdemucs::GpuHtdemucsRunner,
+    mix: &Array3<f32>,
+    options: SeparateOptions,
+    on_progress: &mut dyn FnMut(usize, usize),
+    on_frame: &mut F,
+    trace: &mut dyn TraceSink,
+) -> Result<()>
+where
+    F: FnMut(usize, &[f32]) -> Result<()>,
+{
+    let forward = crate::gpu::htdemucs::DeviceForward::new(model, runner);
+    separate_forwarding_emit(
+        model,
+        &forward,
+        mix,
+        options,
+        on_progress,
+        on_frame,
+        trace,
+    )
+}
+
 /// The shift loop, then the chunking/overlap pass, over either forward
 /// implementation.
+///
+/// Accumulates into an `Array4` for callers that need the full tensor (tests /
+/// in-memory API). Prefer [`separate_forwarding_emit`] when writing stems —
+/// for `shifts <= 1` that path never materialises O(T) output.
 fn separate_forwarding<P>(
     model: &Htdemucs,
     forward: &dyn SegmentForward<Pending = P>,
@@ -286,72 +339,181 @@ fn separate_forwarding<P>(
 ) -> Result<Array4<f32>> {
     let (batch, channels, length) = mix.dim();
     let sources = model.config.sources.len();
-    let batch_chunks = forward_batch();
-    // Streaming OLA (O(segment) rings) matching upstream apply.py; optional
-    // shift view indexes a virtual pad instead of cloning length+2*max_shift.
-    if options.shifts > 0 {
-        let samplerate = model.config.samplerate;
-        let max_shift = (0.5 * samplerate as f64) as usize;
-        let mut out = Array4::<f32>::zeros((batch, sources, channels, length));
-        let mut rng = ShiftRng::new(0x5eed_1234);
-        let mut base = 0usize;
-        let mut pass_total = 0usize;
-        for pass in 0..options.shifts {
-            let offset = rng.randint(max_shift);
-            let trim = max_shift - offset;
-            pass_total = 0;
-            let shift = Some(crate::demucs::streaming::ShiftView { offset, max_shift });
-            crate::demucs::streaming::stream_split_pass(
-                model,
-                forward,
-                mix,
-                options,
-                batch_chunks,
-                shift,
-                &mut |d, t| {
-                    if pass_total == 0 {
-                        pass_total = t;
-                    }
-                    let remaining = options.shifts - pass - 1;
-                    on_progress(base + d, base + t * (remaining + 1));
-                },
-                &mut |t_view, frame| {
-                    if t_view < trim {
-                        return Ok(());
-                    }
-                    let t = t_view - trim;
-                    if t >= length {
-                        return Ok(());
-                    }
-                    for b in 0..batch {
-                        for src in 0..sources {
-                            for c in 0..channels {
-                                out[[b, src, c, t]] +=
-                                    frame[(b * sources + src) * channels + c];
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-                trace,
-            )?;
-            base += pass_total;
-        }
-        let scale = 1.0 / options.shifts as f32;
-        out.mapv_inplace(|v| v * scale);
-        return Ok(out);
-    }
-    let _ = (batch, channels);
-    crate::demucs::streaming::stream_split_pass_collect(
+    let mut out = Array4::<f32>::zeros((batch, sources, channels, length));
+    separate_forwarding_emit(
         model,
         forward,
         mix,
         options,
-        batch_chunks,
-        None,
         on_progress,
+        &mut |t, frame| {
+            for b in 0..batch {
+                for src in 0..sources {
+                    for c in 0..channels {
+                        out[[b, src, c, t]] = frame[(b * sources + src) * channels + c];
+                    }
+                }
+            }
+            Ok(())
+        },
         trace,
-    )
+    )?;
+    Ok(out)
+}
+
+/// Stream finalised (normalised) OLA frames without holding a full-length
+/// output tensor when `shifts <= 1` (the CLI default is 1).
+///
+/// `on_frame(t, frame)` receives original-timeline sample index `t` and a flat
+/// `[b][src][c]` frame. Frames arrive in increasing `t` order with no gaps.
+/// For `shifts > 1` an O(T) accumulator is still used internally (then emitted);
+/// use `shifts <= 1` for O(segment) peak output RAM.
+pub fn separate_forwarding_emit<P, F>(
+    model: &Htdemucs,
+    forward: &dyn SegmentForward<Pending = P>,
+    mix: &Array3<f32>,
+    options: SeparateOptions,
+    on_progress: &mut dyn FnMut(usize, usize),
+    on_frame: &mut F,
+    trace: &mut dyn TraceSink,
+) -> Result<()>
+where
+    F: FnMut(usize, &[f32]) -> Result<()>,
+{
+    let (batch, channels, length) = mix.dim();
+    let sources = model.config.sources.len();
+    let batch_chunks = forward_batch();
+    let frame_width = batch * sources * channels;
+
+    if options.shifts == 0 {
+        crate::demucs::streaming::stream_split_pass(
+            model,
+            forward,
+            mix,
+            options,
+            batch_chunks,
+            None,
+            on_progress,
+            on_frame,
+            trace,
+        )?;
+        return Ok(());
+    }
+
+    let samplerate = model.config.samplerate;
+    let max_shift = (0.5 * samplerate as f64) as usize;
+    let mut rng = ShiftRng::new(0x5eed_1234);
+    let scale = 1.0 / options.shifts as f32;
+
+    // Default shifts=1: one pass, stream trimmed frames (scaled) with no Array4.
+    if options.shifts == 1 {
+        let offset = rng.randint(max_shift);
+        let trim = max_shift - offset;
+        let shift = Some(crate::demucs::streaming::ShiftView { offset, max_shift });
+        let mut scratch = vec![0.0f32; frame_width];
+        crate::demucs::streaming::stream_split_pass(
+            model,
+            forward,
+            mix,
+            SeparateOptions {
+                shifts: 0,
+                ..options
+            },
+            batch_chunks,
+            shift,
+            on_progress,
+            &mut |t_view, frame| {
+                if t_view < trim {
+                    return Ok(());
+                }
+                let t = t_view - trim;
+                if t >= length {
+                    return Ok(());
+                }
+                for (dst, src) in scratch.iter_mut().zip(frame.iter()) {
+                    *dst = *src * scale;
+                }
+                on_frame(t, &scratch)
+            },
+            trace,
+        )?;
+        return Ok(());
+    }
+
+    // shifts > 1: accumulate across passes (O(T)), then emit in order.
+    let mut out = Array4::<f32>::zeros((batch, sources, channels, length));
+    let mut base = 0usize;
+    let mut pass_total = 0usize;
+    for pass in 0..options.shifts {
+        let offset = rng.randint(max_shift);
+        let trim = max_shift - offset;
+        pass_total = 0;
+        let shift = Some(crate::demucs::streaming::ShiftView { offset, max_shift });
+        crate::demucs::streaming::stream_split_pass(
+            model,
+            forward,
+            mix,
+            SeparateOptions {
+                shifts: 0,
+                ..options
+            },
+            batch_chunks,
+            shift,
+            &mut |d, t| {
+                if pass_total == 0 {
+                    pass_total = t;
+                }
+                let remaining = options.shifts - pass - 1;
+                on_progress(base + d, base + t * (remaining + 1));
+            },
+            &mut |t_view, frame| {
+                if t_view < trim {
+                    return Ok(());
+                }
+                let t = t_view - trim;
+                if t >= length {
+                    return Ok(());
+                }
+                for b in 0..batch {
+                    for src in 0..sources {
+                        for c in 0..channels {
+                            out[[b, src, c, t]] +=
+                                frame[(b * sources + src) * channels + c];
+                        }
+                    }
+                }
+                Ok(())
+            },
+            trace,
+        )?;
+        base += pass_total;
+    }
+    let mut scratch = vec![0.0f32; frame_width];
+    for t in 0..length {
+        for b in 0..batch {
+            for src in 0..sources {
+                for c in 0..channels {
+                    scratch[(b * sources + src) * channels + c] = out[[b, src, c, t]] * scale;
+                }
+            }
+        }
+        on_frame(t, &scratch)?;
+    }
+    Ok(())
+}
+
+/// Retained full-buffer OLA for bit-exact comparison against the ring path.
+/// Same maths as pre-streaming `split_pass`; not used by the hot path.
+pub fn split_pass_full<P>(
+    model: &Htdemucs,
+    forward: &dyn SegmentForward<Pending = P>,
+    mix: &Array3<f32>,
+    options: SeparateOptions,
+    batch_chunks: usize,
+    on_progress: &mut dyn FnMut(usize, usize),
+    trace: &mut dyn TraceSink,
+) -> Result<Array4<f32>> {
+    split_pass(model, forward, mix, options, batch_chunks, on_progress, trace)
 }
 
 /// How many segments one forward pass carries, from `DEMUCS_BATCH` (default 1).

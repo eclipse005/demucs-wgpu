@@ -258,6 +258,40 @@ impl Engine {
             ),
         }
     }
+
+    /// Stream normalised frames; with `shifts <= 1` peak output RAM is O(segment).
+    fn separate_emit<F>(
+        &self,
+        mix: &ndarray::Array3<f32>,
+        options: SeparateOptions,
+        on_progress: &mut dyn FnMut(usize, usize),
+        trace: &mut dyn TraceSink,
+        on_frame: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+    {
+        match &self.runner {
+            Some(runner) => pipeline::separate_emit_gpu(
+                &self.host,
+                runner,
+                mix,
+                options,
+                on_progress,
+                on_frame,
+                trace,
+            ),
+            None => pipeline::separate_emit_host(
+                &self.host,
+                &|padded, trace| self.host.forward(padded, trace),
+                mix,
+                options,
+                on_progress,
+                on_frame,
+                trace,
+            ),
+        }
+    }
 }
 
 /// Top-level inference handle.
@@ -377,10 +411,7 @@ impl Demucs {
                 right.len()
             )));
         }
-        let rate = match &self.inner {
-            Inner::Single(engine) => engine.host.config.samplerate,
-            Inner::Bag(bag) => bag[0].0.host.config.samplerate,
-        };
+        let rate = self.sample_rate();
         if sample_rate as usize != rate {
             return Err(Error::Shape(format!(
                 "audio is at {sample_rate} Hz but the model wants {rate} Hz"
@@ -394,15 +425,174 @@ impl Demucs {
         for (index, value) in right.iter().enumerate() {
             mix[[0, 1, index]] = *value;
         }
-        // Two-pass global norm matching upstream `Separator.separate_tensor`
-        // (`demucs/api.py`): Pass A scans mean/std, Pass B applies in place.
-        // The split/OLA path is streaming (`pipeline` → `streaming`) so the
-        // accumulator is O(segment); the returned stems are still O(T).
-        let norm = crate::demucs::streaming::scan_norm(&mix);
-        crate::demucs::streaming::apply_norm_inplace(&mut mix, norm);
-        let mut sources = self.collect(&mix, options, trace, on_progress)?;
+        self.run_mix(&mut mix, options, trace, on_progress)
+    }
+
+    /// Separate an already-built `(1, channels, samples)` mix in place
+    /// (normalises `mix`). Prefer this over [`Self::separate`] when the caller
+    /// already holds an `Array3` — avoids cloning into left/right slices.
+    pub fn separate_mix(
+        &self,
+        mix: &mut ndarray::Array3<f32>,
+        options: &SeparateOptions,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> Result<Vec<Stem>> {
+        self.run_mix(mix, options, &mut NoTrace, on_progress)
+    }
+
+    fn run_mix(
+        &self,
+        mix: &mut ndarray::Array3<f32>,
+        options: &SeparateOptions,
+        trace: &mut dyn TraceSink,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> Result<Vec<Stem>> {
+        if mix.dim().0 != 1 || mix.dim().1 != AUDIO_CHANNELS {
+            return Err(Error::Shape(format!(
+                "mix must be (1, {AUDIO_CHANNELS}, samples), got {:?}",
+                mix.dim()
+            )));
+        }
+        // Two-pass global norm matching upstream `Separator.separate_tensor`.
+        let norm = crate::demucs::streaming::scan_norm(mix);
+        crate::demucs::streaming::apply_norm_inplace(mix, norm);
+        // Single-network + shifts<=1: fill stem buffers from the emit path so we
+        // never hold a full Array4. Bag / shifts>1 still go through collect.
+        if matches!(self.inner, Inner::Single(_)) && options.shifts <= 1 {
+            return self.collect_stems_streaming(mix, options, norm, trace, on_progress);
+        }
+        let mut sources = self.collect(mix, options, trace, on_progress)?;
         pipeline::denormalize(&mut sources, norm);
-        Ok(self.stems(sources))
+        Ok(self.stems_from_array(sources))
+    }
+
+    /// Stream denormalised frames into pre-sized stem `Vec`s (Single, shifts<=1).
+    fn collect_stems_streaming(
+        &self,
+        mix: &ndarray::Array3<f32>,
+        options: &SeparateOptions,
+        norm: pipeline::GlobalNorm,
+        trace: &mut dyn TraceSink,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+    ) -> Result<Vec<Stem>> {
+        let Inner::Single(engine) = &self.inner else {
+            unreachable!("collect_stems_streaming is Single-only");
+        };
+        let names = engine.host.config.sources.clone();
+        let samples = mix.dim().2;
+        let sources = names.len();
+        let wanted = |id: StemId| match &self.selection {
+            StemSelection::All => true,
+            StemSelection::Some(list) => list.contains(&id),
+        };
+        let mut lanes: Vec<Option<(StemId, Vec<f32>, Vec<f32>)>> = names
+            .iter()
+            .map(|name| {
+                let id = StemId::parse(name)?;
+                if !wanted(id) {
+                    return None;
+                }
+                Some((id, vec![0.0f32; samples], vec![0.0f32; samples]))
+            })
+            .collect();
+        // Still O(T) for the returned stems (API contract), but one copy — not
+        // Array4 + denorm + to_vec.
+        engine.separate_emit(
+            mix,
+            *options,
+            &mut |done, total| on_progress(SeparationProgress { done, total }),
+            trace,
+            &mut |t, frame| {
+                // frame: [b=0][src][c] with batch 1
+                for (src, lane) in lanes.iter_mut().enumerate() {
+                    if let Some((_, left, right)) = lane.as_mut() {
+                        let base = src * AUDIO_CHANNELS;
+                        left[t] = frame[base] * norm.std + norm.mean;
+                        right[t] = frame[base + 1] * norm.std + norm.mean;
+                    }
+                }
+                let _ = sources;
+                Ok(())
+            },
+        )?;
+        Ok(lanes
+            .into_iter()
+            .flatten()
+            .map(|(id, left, right)| Stem { id, left, right })
+            .collect())
+    }
+
+    /// Stream denormalised frames to a callback without retaining stem `Vec`s.
+    ///
+    /// With a single network and `shifts <= 1`, peak output RAM is O(segment)
+    /// (OLA rings + the writer's buffer). `mix` is normalised in place.
+    /// `on_frame(t, frame)` receives a flat `[src][ch]` denormalised frame
+    /// (batch is 1). Bag models fall back to materialising then replaying.
+    pub fn separate_streaming<F>(
+        &self,
+        mix: &mut ndarray::Array3<f32>,
+        options: &SeparateOptions,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+        on_frame: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+    {
+        self.separate_streaming_traced(mix, options, &mut NoTrace, on_progress, on_frame)
+    }
+
+    pub fn separate_streaming_traced<F>(
+        &self,
+        mix: &mut ndarray::Array3<f32>,
+        options: &SeparateOptions,
+        trace: &mut dyn TraceSink,
+        on_progress: &mut dyn FnMut(SeparationProgress),
+        on_frame: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[f32]) -> Result<()>,
+    {
+        if mix.dim().0 != 1 || mix.dim().1 != AUDIO_CHANNELS {
+            return Err(Error::Shape(format!(
+                "mix must be (1, {AUDIO_CHANNELS}, samples), got {:?}",
+                mix.dim()
+            )));
+        }
+        let norm = crate::demucs::streaming::scan_norm(mix);
+        crate::demucs::streaming::apply_norm_inplace(mix, norm);
+        let sources = self.sources().len();
+        let mut scratch = vec![0.0f32; sources * AUDIO_CHANNELS];
+
+        match &self.inner {
+            Inner::Single(engine) if options.shifts <= 1 => {
+                engine.separate_emit(
+                    mix,
+                    *options,
+                    &mut |done, total| on_progress(SeparationProgress { done, total }),
+                    trace,
+                    &mut |t, frame| {
+                        for i in 0..scratch.len() {
+                            scratch[i] = frame[i] * norm.std + norm.mean;
+                        }
+                        on_frame(t, &scratch)
+                    },
+                )
+            }
+            _ => {
+                // Bag or shifts>1: collect, denorm, replay in order.
+                let mut array = self.collect(mix, options, trace, on_progress)?;
+                pipeline::denormalize(&mut array, norm);
+                let length = array.dim().3;
+                for t in 0..length {
+                    for src in 0..sources {
+                        scratch[src * AUDIO_CHANNELS] = array[[0, src, 0, t]];
+                        scratch[src * AUDIO_CHANNELS + 1] = array[[0, src, 1, t]];
+                    }
+                    on_frame(t, &scratch)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Separates a WAV file (mono is duplicated to stereo). The `--two-stems`-style
@@ -569,7 +759,7 @@ impl Demucs {
     }
 
     /// Picks the requested stems out of a per-source array.
-    fn stems(&self, sources: ndarray::Array4<f32>) -> Vec<Stem> {
+    fn stems_from_array(&self, sources: ndarray::Array4<f32>) -> Vec<Stem> {
         let names = match &self.inner {
             Inner::Single(engine) => engine.host.config.sources.clone(),
             Inner::Bag(bag) => bag[0].0.host.config.sources.clone(),

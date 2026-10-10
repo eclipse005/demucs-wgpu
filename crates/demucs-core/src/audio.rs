@@ -340,39 +340,57 @@ pub fn write_wav(
         _ => 1,              // PCM
     };
     let block_align = (channels as u32) * bytes_per_sample;
-    let data_bytes = (data.len() as u32) * bytes_per_sample;
+    let data_bytes = (frames as u64)
+        .checked_mul(block_align as u64)
+        .ok_or_else(|| Error::Audio("WAV data chunk too large".into()))?;
+    if data_bytes > u32::MAX as u64 || 36 + data_bytes > u32::MAX as u64 {
+        return Err(Error::Audio(
+            "WAV larger than 4 GiB is not supported by classic RIFF".into(),
+        ));
+    }
+    let data_bytes_u32 = data_bytes as u32;
 
-    let mut out = Vec::with_capacity(data_bytes as usize + 64);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_bytes).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&format_tag.to_le_bytes());
-    out.extend_from_slice(&(channels as u16).to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&(sample_rate * block_align).to_le_bytes());
-    out.extend_from_slice(&(block_align as u16).to_le_bytes());
-    out.extend_from_slice(&(bytes_per_sample as u16 * 8).to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_bytes.to_le_bytes());
+    // Stream frames through a buffered writer — never build a whole-file Vec.
+    let file = std::fs::File::create(path).with_path(path)?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    out.write_all(b"RIFF").with_path(path)?;
+    out.write_all(&(36 + data_bytes_u32).to_le_bytes()).with_path(path)?;
+    out.write_all(b"WAVE").with_path(path)?;
+    out.write_all(b"fmt ").with_path(path)?;
+    out.write_all(&16u32.to_le_bytes()).with_path(path)?;
+    out.write_all(&format_tag.to_le_bytes()).with_path(path)?;
+    out.write_all(&(channels as u16).to_le_bytes()).with_path(path)?;
+    out.write_all(&sample_rate.to_le_bytes()).with_path(path)?;
+    out.write_all(&(sample_rate * block_align).to_le_bytes())
+        .with_path(path)?;
+    out.write_all(&(block_align as u16).to_le_bytes()).with_path(path)?;
+    out.write_all(&(bytes_per_sample as u16 * 8).to_le_bytes())
+        .with_path(path)?;
+    out.write_all(b"data").with_path(path)?;
+    out.write_all(&data_bytes_u32.to_le_bytes()).with_path(path)?;
+    let mut frame_buf = vec![0u8; block_align as usize];
     for frame in 0..frames {
+        let mut o = 0usize;
         for channel in 0..channels {
             let value = data[channel * frames + frame];
             match subtype {
-                Subtype::Float => out.extend_from_slice(&value.to_le_bytes()),
+                Subtype::Float => {
+                    frame_buf[o..o + 4].copy_from_slice(&value.to_le_bytes());
+                    o += 4;
+                }
                 Subtype::Pcm16 => {
-                    out.extend_from_slice(&quantize(value, 16).to_le_bytes()[..2])
+                    frame_buf[o..o + 2].copy_from_slice(&quantize(value, 16).to_le_bytes()[..2]);
+                    o += 2;
                 }
                 Subtype::Pcm24 => {
-                    out.extend_from_slice(&quantize(value, 24).to_le_bytes()[..3])
+                    frame_buf[o..o + 3].copy_from_slice(&quantize(value, 24).to_le_bytes()[..3]);
+                    o += 3;
                 }
             }
         }
+        out.write_all(&frame_buf).with_path(path)?;
     }
-
-    let mut file = std::fs::File::create(path).with_path(path)?;
-    file.write_all(&out).with_path(path)?;
+    out.flush().with_path(path)?;
     Ok(())
 }
 
@@ -384,6 +402,120 @@ pub fn write_wav_f32(
     data: &[f32],
 ) -> Result<()> {
     write_wav(path, Subtype::Float, sample_rate, channels, data)
+}
+
+/// Incremental IEEE float32 WAV writer: header with placeholder sizes, then
+/// interleaved frames via a buffered writer, then a seek to patch RIFF/data
+/// sizes. Peak RAM is O(buffer), not O(T).
+pub struct FloatWavWriter {
+    path: std::path::PathBuf,
+    file: std::io::BufWriter<std::fs::File>,
+    sample_rate: u32,
+    channels: usize,
+    frames: u64,
+}
+
+impl FloatWavWriter {
+    /// Creates `path` and writes a float32 WAV header with zeroed sizes.
+    pub fn create(path: impl AsRef<Path>, sample_rate: u32, channels: usize) -> Result<Self> {
+        let path_ref = path.as_ref();
+        if channels == 0 {
+            return Err(Error::Audio("cannot write zero channels".into()));
+        }
+        let file = std::fs::File::create(path_ref).with_path(path_ref)?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        let block_align = (channels as u32) * 4;
+        out.write_all(b"RIFF").with_path(path_ref)?;
+        out.write_all(&0u32.to_le_bytes()).with_path(path_ref)?; // patch later
+        out.write_all(b"WAVE").with_path(path_ref)?;
+        out.write_all(b"fmt ").with_path(path_ref)?;
+        out.write_all(&16u32.to_le_bytes()).with_path(path_ref)?;
+        out.write_all(&3u16.to_le_bytes()).with_path(path_ref)?; // IEEE float
+        out.write_all(&(channels as u16).to_le_bytes()).with_path(path_ref)?;
+        out.write_all(&sample_rate.to_le_bytes()).with_path(path_ref)?;
+        out.write_all(&(sample_rate * block_align).to_le_bytes())
+            .with_path(path_ref)?;
+        out.write_all(&(block_align as u16).to_le_bytes()).with_path(path_ref)?;
+        out.write_all(&32u16.to_le_bytes()).with_path(path_ref)?;
+        out.write_all(b"data").with_path(path_ref)?;
+        out.write_all(&0u32.to_le_bytes()).with_path(path_ref)?; // patch later
+        Ok(Self {
+            path: path_ref.to_path_buf(),
+            file: out,
+            sample_rate,
+            channels,
+            frames: 0,
+        })
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn frames_written(&self) -> u64 {
+        self.frames
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Writes one interleaved frame (`frame.len() == channels`).
+    pub fn write_frame(&mut self, frame: &[f32]) -> Result<()> {
+        if frame.len() != self.channels {
+            return Err(Error::Audio(format!(
+                "expected {} channels, got {}",
+                self.channels,
+                frame.len()
+            )));
+        }
+        for &value in frame {
+            self.file
+                .write_all(&value.to_le_bytes())
+                .with_path(&self.path)?;
+        }
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Writes `n` interleaved frames from a flat `[frame0_ch0, frame0_ch1, ...]`.
+    pub fn write_interleaved(&mut self, interleaved: &[f32]) -> Result<()> {
+        if interleaved.len() % self.channels != 0 {
+            return Err(Error::Audio(format!(
+                "{} samples do not divide into {} channels",
+                interleaved.len(),
+                self.channels
+            )));
+        }
+        for frame in interleaved.chunks_exact(self.channels) {
+            self.write_frame(frame)?;
+        }
+        Ok(())
+    }
+
+    /// Flushes, seeks back, and patches RIFF / data chunk sizes.
+    pub fn finish(mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        self.file.flush().with_path(&self.path)?;
+        let data_bytes = self
+            .frames
+            .checked_mul(self.channels as u64 * 4)
+            .ok_or_else(|| Error::Audio("WAV data chunk too large".into()))?;
+        if data_bytes > u32::MAX as u64 || 36 + data_bytes > u32::MAX as u64 {
+            return Err(Error::Audio(
+                "WAV larger than 4 GiB is not supported by classic RIFF".into(),
+            ));
+        }
+        let file = self.file.get_mut();
+        file.seek(SeekFrom::Start(4)).with_path(&self.path)?;
+        file.write_all(&(36 + data_bytes as u32).to_le_bytes())
+            .with_path(&self.path)?;
+        file.seek(SeekFrom::Start(40)).with_path(&self.path)?;
+        file.write_all(&(data_bytes as u32).to_le_bytes())
+            .with_path(&self.path)?;
+        file.flush().with_path(&self.path)?;
+        Ok(())
+    }
 }
 
 /// Writes a FLAC stream, matching `sf.write(..., format='FLAC')`.
@@ -639,5 +771,27 @@ mod tests {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.0, 3.0, 2.0, 4.0], "frames must interleave L,R");
+    }
+
+    #[test]
+    fn float_wav_writer_matches_write_wav_f32() {
+        let dir = std::env::temp_dir().join("demucs-audio-stream-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let streamed = dir.join("streamed.wav");
+        let bulk = dir.join("bulk.wav");
+        // channel-major for bulk: L=[0.25,-0.75,0.5], R=[1.0,-1.0,0.0]
+        let channel_major = [0.25f32, -0.75, 0.5, 1.0, -1.0, 0.0];
+        write_wav_f32(&bulk, 22050, 2, &channel_major).unwrap();
+        let mut w = FloatWavWriter::create(&streamed, 22050, 2).unwrap();
+        w.write_frame(&[0.25, 1.0]).unwrap();
+        w.write_frame(&[-0.75, -1.0]).unwrap();
+        w.write_frame(&[0.5, 0.0]).unwrap();
+        w.finish().unwrap();
+        let a = read_audio(&streamed).unwrap();
+        let b = read_audio(&bulk).unwrap();
+        assert_eq!(a.sample_rate, b.sample_rate);
+        assert_eq!(a.channels(), b.channels());
+        assert_eq!(a.channel(0), b.channel(0));
+        assert_eq!(a.channel(1), b.channel(1));
     }
 }
