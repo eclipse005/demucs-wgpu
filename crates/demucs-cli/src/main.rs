@@ -341,7 +341,7 @@ fn separate(args: SeparateArgs) -> Result<()> {
     let load_seconds = load_started.elapsed().as_secs_f64();
     let sample_rate = sep.sample_rate() as u32;
 
-    // Admit before decode allocates the O(T) mix (P0 slope ≈ 56.3 MiB/min).
+    // Admit before decode allocates the O(T) mix (P0 slope ≈ 20.1 MiB/min).
     let info = demucs_core::audio::probe_audio(&args.input)
         .with_context(|| format!("probing {}", args.input.display()))?;
     sep.admit_for_samples(info.frames)

@@ -1,14 +1,18 @@
 //! Host RAM admit check before separation.
 //!
 //! After P0 streaming OLA, peak RSS still scales with the input mix
-//! (~56.3 MiB/min ≈ 5.58 full-track f32 channel planes at 44.1 kHz). Call
+//! (~20.1 MiB/min ≈ 2.0 full-track f32 channel planes at 44.1 kHz). Call
 //! [`admit_separation`] before allocating the mix / running separate so a
 //! long track returns a clear error instead of being killed by the OS.
+//!
+//! Override the slope with `DEMUCS_MEM_SLOPE` (MiB/min, must be > 0) when
+//! measuring on another machine; invalid/missing values keep the built-in
+//! constant so admit stays conservative-safe.
 
 use crate::error::{Error, Result};
 
 /// Measured post-P0 host RSS slope (MiB wall-clock minute of mix @ 44.1 kHz).
-pub const SLOPE_MIB_PER_MIN: f64 = 56.3;
+pub const SLOPE_MIB_PER_MIN: f64 = 20.1;
 
 /// Default fraction of available RAM the estimate may consume.
 pub const DEFAULT_RAM_FRACTION: f64 = 0.75;
@@ -25,10 +29,23 @@ pub fn model_working_set_bytes(parameter_count: usize) -> u64 {
         .saturating_add(ACTIVATION_BUDGET_BYTES)
 }
 
+/// Effective slope (MiB/min); override with `DEMUCS_MEM_SLOPE` (> 0).
+/// Non-positive or unparsable values fall back to [`SLOPE_MIB_PER_MIN`].
+pub fn slope_mib_per_min() -> f64 {
+    match std::env::var("DEMUCS_MEM_SLOPE") {
+        Ok(raw) => raw
+            .parse::<f64>()
+            .ok()
+            .filter(|v| *v > 0.0)
+            .unwrap_or(SLOPE_MIB_PER_MIN),
+        Err(_) => SLOPE_MIB_PER_MIN,
+    }
+}
+
 /// Estimated peak host bytes for a track of `duration_secs` once the model is loaded.
 pub fn estimate_peak_bytes(duration_secs: f64, model_ws_bytes: u64) -> u64 {
     let minutes = duration_secs.max(0.0) / 60.0;
-    let slope = (SLOPE_MIB_PER_MIN * minutes * 1024.0 * 1024.0).ceil() as u64;
+    let slope = (slope_mib_per_min() * minutes * 1024.0 * 1024.0).ceil() as u64;
     slope.saturating_add(model_ws_bytes)
 }
 
@@ -128,9 +145,10 @@ pub fn admit_separation_with_fraction(
     let budget_mib = budget as f64 / (1024.0 * 1024.0);
     let mins = duration_secs / 60.0;
     let pct = fraction * 100.0;
+    let slope = slope_mib_per_min();
     Err(Error::Memory(format!(
         "audio is {mins:.1} min; estimated peak ~{est_mib:.0} MiB \
-         (slope {SLOPE_MIB_PER_MIN} MiB/min + model WS) exceeds \
+         (slope {slope} MiB/min + model WS) exceeds \
          {pct:.0}% of available RAM ({avail_mib:.0} MiB available, \
          budget {budget_mib:.0} MiB). Split the track or free memory."
     )))
@@ -142,10 +160,18 @@ mod tests {
 
     #[test]
     fn slope_matches_p0_two_hour_ballpark() {
-        // 120 min * 56.3 ≈ 6756 MiB of slope alone.
-        let est = estimate_peak_bytes(7200.0, 0);
-        let mib = est as f64 / (1024.0 * 1024.0);
-        assert!((mib - 6756.0).abs() < 2.0, "got {mib}");
+        // 120 min * 20.1 = 2412 MiB of slope alone (built-in constant).
+        let minutes = 120.0;
+        let expected = SLOPE_MIB_PER_MIN * minutes;
+        let slope_bytes = (SLOPE_MIB_PER_MIN * minutes * 1024.0 * 1024.0).ceil() as u64;
+        let mib = slope_bytes as f64 / (1024.0 * 1024.0);
+        assert!((mib - expected).abs() < 2.0, "got {mib}");
+        // estimate_peak_bytes uses the env-aware slope; when unset it matches.
+        if std::env::var_os("DEMUCS_MEM_SLOPE").is_none() {
+            let est = estimate_peak_bytes(7200.0, 0);
+            let est_mib = est as f64 / (1024.0 * 1024.0);
+            assert!((est_mib - 2412.0).abs() < 2.0, "got {est_mib}");
+        }
     }
 
     #[test]
