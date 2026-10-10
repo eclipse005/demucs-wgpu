@@ -341,6 +341,11 @@ fn separate(args: SeparateArgs) -> Result<()> {
     let load_seconds = load_started.elapsed().as_secs_f64();
     let sample_rate = sep.sample_rate() as u32;
 
+    // Admit before decode allocates the O(T) mix (P0 slope ≈ 56.3 MiB/min).
+    let info = demucs_core::audio::probe_audio(&args.input)
+        .with_context(|| format!("probing {}", args.input.display()))?;
+    sep.admit_for_samples(info.frames)
+        .with_context(|| "memory admit check")?;
     // One mix buffer — no left/right clones. Streaming OLA flushes frames
     // straight into FloatWavWriter so peak output RAM stays O(segment).
     let mut mix = read_mix(&args.input, AUDIO_CHANNELS)?;

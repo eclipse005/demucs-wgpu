@@ -418,6 +418,7 @@ impl Demucs {
             )));
         }
         let samples = left.len();
+        self.admit_for_samples(samples)?;
         let mut mix = ndarray::Array3::<f32>::zeros((1, AUDIO_CHANNELS, samples));
         for (index, value) in left.iter().enumerate() {
             mix[[0, 0, index]] = *value;
@@ -453,6 +454,7 @@ impl Demucs {
                 mix.dim()
             )));
         }
+        self.admit_for_samples(mix.dim().2)?;
         // Two-pass global norm matching upstream `Separator.separate_tensor`.
         let norm = crate::demucs::streaming::scan_norm(mix);
         crate::demucs::streaming::apply_norm_inplace(mix, norm);
@@ -558,6 +560,7 @@ impl Demucs {
                 mix.dim()
             )));
         }
+        self.admit_for_samples(mix.dim().2)?;
         let norm = crate::demucs::streaming::scan_norm(mix);
         crate::demucs::streaming::apply_norm_inplace(mix, norm);
         let sources = self.sources().len();
@@ -604,28 +607,25 @@ impl Demucs {
         on_progress: &mut dyn FnMut(SeparationProgress),
     ) -> Result<Vec<Stem>> {
         let path = path.as_ref();
-        let rate = match &self.inner {
-            Inner::Single(engine) => engine.host.config.samplerate,
-            Inner::Bag(bag) => bag[0].0.host.config.samplerate,
-        };
-        let audio = crate::audio::read_audio(path)?;
-        if audio.sample_rate as usize != rate {
+        let rate = self.sample_rate();
+        // Probe duration first so the admit check can refuse before decode allocates.
+        let info = crate::audio::probe_audio(path)?;
+        if info.sample_rate as usize != rate {
             return Err(Error::Shape(format!(
                 "{} is at {} Hz but the model wants {rate} Hz",
                 path.display(),
-                audio.sample_rate
+                info.sample_rate
             )));
         }
+        let frames = info.frames;
+        self.admit_for_samples(frames)?;
+        let audio = crate::audio::read_audio(path)?;
         let audio = audio.ensure_channels(AUDIO_CHANNELS)?;
-        let left = audio.channel(0).to_vec();
-        let right = audio.channel(1).to_vec();
-        self.separate_with_options(
-            &left,
-            &right,
-            audio.sample_rate,
-            &SeparateOptions::default(),
-            on_progress,
-        )
+        let samples = audio.samples;
+        let channels = audio.channels();
+        let mut mix = ndarray::Array3::from_shape_vec((1, channels, samples), audio.data)
+            .map_err(|e| Error::Shape(e.to_string()))?;
+        self.separate_mix(&mut mix, &SeparateOptions::default(), on_progress)
     }
 
     /// Which backend this handle actually runs on.
@@ -656,6 +656,29 @@ impl Demucs {
     /// the order [`Self::separate`] lays the returned stems' samples in.
     pub fn sources(&self) -> &[String] {
         &self.first_config().sources
+    }
+
+    /// Host working-set bytes used by the RAM admit check (weights + activation budget).
+    pub fn working_set_bytes(&self) -> u64 {
+        crate::mem::model_working_set_bytes(self.parameter_count())
+    }
+
+    /// Total `f32` parameters across every loaded network.
+    pub fn parameter_count(&self) -> usize {
+        match &self.inner {
+            Inner::Single(engine) => engine.host.weights.parameter_count(),
+            Inner::Bag(bag) => bag
+                .iter()
+                .map(|(engine, _)| engine.host.weights.parameter_count())
+                .sum(),
+        }
+    }
+
+    /// Refuse before allocating O(T) buffers when the P0 slope estimate will not fit.
+    pub fn admit_for_samples(&self, samples: usize) -> Result<()> {
+        let rate = self.sample_rate().max(1) as f64;
+        let duration = samples as f64 / rate;
+        crate::mem::admit_separation(duration, self.working_set_bytes())
     }
 
     /// Config of the first network; every network in a bag shares it.

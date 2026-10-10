@@ -34,6 +34,7 @@ pub mod dsp;
 pub mod error;
 pub mod fixtures;
 pub mod gpu;
+pub mod mem;
 pub mod npy;
 pub mod ops;
 pub mod paths;

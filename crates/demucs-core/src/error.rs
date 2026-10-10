@@ -48,6 +48,9 @@ pub enum Error {
 
     #[error("gpu error: {0}")]
     Gpu(String),
+
+    #[error("memory: {0}")]
+    Memory(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
