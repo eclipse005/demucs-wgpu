@@ -8,10 +8,12 @@ pub mod config;
 pub mod host;
 pub mod ops;
 pub mod pipeline;
+pub mod streaming;
 pub mod spec;
 pub mod weights;
 
 pub use config::{HtdemucsArch, HtdemucsConfig, LayerSpec};
 pub use host::{Htdemucs, NoTrace, Normalisation, TraceSink, VecTrace};
 pub use pipeline::{normalize, separate, SeparateOptions};
+pub use streaming::{apply_norm_inplace, scan_norm, separate_streaming_normalized, ShiftView, SplitMeta};
 pub use weights::{load_weights, HtdemucsWeights, LoadedWeights};

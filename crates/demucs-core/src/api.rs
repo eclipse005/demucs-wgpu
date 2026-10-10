@@ -394,13 +394,13 @@ impl Demucs {
         for (index, value) in right.iter().enumerate() {
             mix[[0, 1, index]] = *value;
         }
-        // `Htdemucs::forward` (host and device) works in the normalised domain,
-        // exactly as the reference's `Separator.separate_tensor` does: normalise
-        // the raw track, run the (bag of) networks, undo it on the way out. This
-        // is the round-trip the CLI used to own; the facade does it so every
-        // caller of `separate` gets real samples back, not normalised ones.
-        let (normalized, norm) = pipeline::normalize(&mix);
-        let mut sources = self.collect(&normalized, options, trace, on_progress)?;
+        // Two-pass global norm matching upstream `Separator.separate_tensor`
+        // (`demucs/api.py`): Pass A scans mean/std, Pass B applies in place.
+        // The split/OLA path is streaming (`pipeline` → `streaming`) so the
+        // accumulator is O(segment); the returned stems are still O(T).
+        let norm = crate::demucs::streaming::scan_norm(&mix);
+        crate::demucs::streaming::apply_norm_inplace(&mut mix, norm);
+        let mut sources = self.collect(&mix, options, trace, on_progress)?;
         pipeline::denormalize(&mut sources, norm);
         Ok(self.stems(sources))
     }

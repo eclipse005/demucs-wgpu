@@ -44,40 +44,15 @@ pub struct GlobalNorm {
     pub std: f32,
 }
 
-/// `(wav - mean) / (std + 1e-8)` over the channel-averaged signal.
+/// `(wav - mean) / std` over the channel-averaged signal.
+///
+/// Matches upstream `Separator.separate_tensor` (`demucs/api.py`):
+/// `ref = wav.mean(0)`, `mean = ref.mean()`, `std = ref.std() + 1e-8`.
 pub fn normalize(wav: &Array3<f32>) -> (Array3<f32>, GlobalNorm) {
-    let (batch, channels, length) = wav.dim();
-    // `ref = wav.mean(0)` then `mean = ref.mean()`, `std = ref.std()`.
-    let mut reference = vec![0.0f64; length];
-    for b in 0..batch {
-        for t in 0..length {
-            let mut sum = 0.0f64;
-            for c in 0..channels {
-                sum += wav[[b, c, t]] as f64;
-            }
-            reference[t] += sum / channels as f64;
-        }
-    }
-    let count = (batch * length) as f64;
-    let mean = reference.iter().sum::<f64>() / count;
-    let variance = reference
-        .iter()
-        .map(|v| (v - mean) * (v - mean))
-        .sum::<f64>()
-        / (count - 1.0);
-    let std = variance.sqrt() as f32 + 1e-8;
-
+    let norm = crate::demucs::streaming::scan_norm(wav);
     let mut out = wav.clone();
-    for value in out.iter_mut() {
-        *value = (*value - mean as f32) / std;
-    }
-    (
-        out,
-        GlobalNorm {
-            mean: mean as f32,
-            std,
-        },
-    )
+    crate::demucs::streaming::apply_norm_inplace(&mut out, norm);
+    (out, norm)
 }
 
 /// Inverse of [`normalize`], applied to the `(batch, sources, channels, time)`
@@ -90,7 +65,7 @@ pub fn denormalize(sources: &mut Array4<f32>, norm: GlobalNorm) {
 
 /// `TensorChunk.padded`: centre the chunk inside `target_length` zeros, taking
 /// whatever context the parent signal has on each side.
-fn padded_chunk(
+pub(crate) fn padded_chunk(
     mix: &Array3<f32>,
     offset: usize,
     length: usize,
@@ -157,7 +132,7 @@ pub fn transition_weight(segment_length: usize, transition_power: f64) -> Vec<f3
 /// A small deterministic RNG for the shift offsets. The reference uses the
 /// unseeded global `random` module, so its offsets are not reproducible either;
 /// this one at least makes our own runs repeatable.
-struct ShiftRng(u64);
+pub(crate) struct ShiftRng(u64);
 
 impl ShiftRng {
     fn new(seed: u64) -> Self {
@@ -310,33 +285,29 @@ fn separate_forwarding<P>(
     trace: &mut dyn TraceSink,
 ) -> Result<Array4<f32>> {
     let (batch, channels, length) = mix.dim();
+    let sources = model.config.sources.len();
     let batch_chunks = forward_batch();
+    // Streaming OLA (O(segment) rings) matching upstream apply.py; optional
+    // shift view indexes a virtual pad instead of cloning length+2*max_shift.
     if options.shifts > 0 {
         let samplerate = model.config.samplerate;
         let max_shift = (0.5 * samplerate as f64) as usize;
-        let padded = padded_chunk(mix, 0, length, length + 2 * max_shift)?;
-        let mut out: Option<Array4<f32>> = None;
+        let mut out = Array4::<f32>::zeros((batch, sources, channels, length));
         let mut rng = ShiftRng::new(0x5eed_1234);
-        // One work unit is a segment, and the total spans every shift pass. Each
-        // pass runs over its own shifted slice, so its segment count is only
-        // known once the first callback fires; `base` walks the done counter
-        // forward by each completed pass's actual count so the whole run is
-        // monotonic and ends at `done == total`.
         let mut base = 0usize;
         let mut pass_total = 0usize;
         for pass in 0..options.shifts {
             let offset = rng.randint(max_shift);
-            let shifted_length = length + max_shift - offset;
-            let shifted = padded
-                .slice(s![.., .., offset..offset + shifted_length])
-                .to_owned();
+            let trim = max_shift - offset;
             pass_total = 0;
-            let result = split_pass(
+            let shift = Some(crate::demucs::streaming::ShiftView { offset, max_shift });
+            crate::demucs::streaming::stream_split_pass(
                 model,
                 forward,
-                &shifted,
+                mix,
                 options,
                 batch_chunks,
+                shift,
                 &mut |d, t| {
                     if pass_total == 0 {
                         pass_total = t;
@@ -344,24 +315,43 @@ fn separate_forwarding<P>(
                     let remaining = options.shifts - pass - 1;
                     on_progress(base + d, base + t * (remaining + 1));
                 },
+                &mut |t_view, frame| {
+                    if t_view < trim {
+                        return Ok(());
+                    }
+                    let t = t_view - trim;
+                    if t >= length {
+                        return Ok(());
+                    }
+                    for b in 0..batch {
+                        for src in 0..sources {
+                            for c in 0..channels {
+                                out[[b, src, c, t]] +=
+                                    frame[(b * sources + src) * channels + c];
+                            }
+                        }
+                    }
+                    Ok(())
+                },
                 trace,
             )?;
             base += pass_total;
-            let trimmed = result
-                .slice(s![.., .., .., max_shift - offset..])
-                .to_owned();
-            out = Some(match out {
-                None => trimmed,
-                Some(previous) => previous + trimmed,
-            });
         }
-        let mut out = out.expect("at least one shift");
         let scale = 1.0 / options.shifts as f32;
         out.mapv_inplace(|v| v * scale);
         return Ok(out);
     }
     let _ = (batch, channels);
-    split_pass(model, forward, mix, options, batch_chunks, on_progress, trace)
+    crate::demucs::streaming::stream_split_pass_collect(
+        model,
+        forward,
+        mix,
+        options,
+        batch_chunks,
+        None,
+        on_progress,
+        trace,
+    )
 }
 
 /// How many segments one forward pass carries, from `DEMUCS_BATCH` (default 1).
