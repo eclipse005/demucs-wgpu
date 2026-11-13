@@ -13,7 +13,7 @@
 use crate::error::{Error, Result};
 use crate::gpu::arena::{bind_group, Arena, DevTensor, Recorder};
 use crate::gpu::shaders;
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, PipeJob};
 
 /// Workgroup size for the row-wise kernels, mirroring `shaders::ROW_THREADS`.
 const ROW_THREADS: usize = shaders::ROW_THREADS;
@@ -471,319 +471,163 @@ pub struct Kernels {
 
 impl Kernels {
     pub fn new(gpu: &Gpu) -> Result<Self> {
-        Ok(Self {
-            gemm: gpu.pipeline("gemm_f32", &shaders::gemm_f32(false), "gemm")?,
-            gemm_batched: gpu.pipeline(
-                "gemm_f32_batched",
-                &shaders::gemm_f32(true),
-                "gemm",
-            )?,
-            gemm_transb: gpu.pipeline(
-                "gemm_f32_transb",
-                &shaders::gemm_f32_transb(true),
-                "gemm",
-            )?,
-            gemm_transb_plain: gpu.pipeline(
-                "gemm_f32_transb_plain",
-                &shaders::gemm_f32_transb(false),
-                "gemm",
-            )?,
-            gemm_bm64: gpu.pipeline("gemm_f32_bm64", &shaders::gemm_bm64(), "gemm")?,
-            gemm_bm64_coalesced: gpu.pipeline(
-                "gemm_f32_bm64_coalesced",
-                &shaders::gemm_bm64_coalesced(),
-                "gemm",
-            )?,
+        // 一遍批建（见 `Gpu::pipelines`）：逐条建时这一阶段在 DX12 上要
+        // 30 s 量级，铺到核上之后是 8 s 量级。条件构建的那几条（subgroup
+        // 专用的 warp 归约）留在下面，它们本来就要看适配器。
+        let jobs = [
+            PipeJob::new("gemm_f32", shaders::gemm_f32(false), "gemm"),
+            PipeJob::new("gemm_f32_batched", shaders::gemm_f32(true), "gemm"),
+            PipeJob::new("gemm_f32_transb", shaders::gemm_f32_transb(true), "gemm"),
+            PipeJob::new("gemm_f32_transb_plain", shaders::gemm_f32_transb(false), "gemm"),
+            PipeJob::new("gemm_f32_bm64", shaders::gemm_bm64(), "gemm"),
+            PipeJob::new("gemm_f32_bm64_coalesced", shaders::gemm_bm64_coalesced(), "gemm"),
             // The batched form of `gemm_bm64`, which is what a convolution
             // uses now that its per-batch blocks are stitched into one
             // dispatch rather than bound one at a time.
-            gemm_batched_bm64_bn128: gpu.pipeline(
-                "gemm_f32_batched_bm64_bn128",
-                &shaders::gemm_batched_bm64_bn128(),
-                "gemm",
-            )?,
-            gemm_batched_bm64_bn128_coalesced: gpu.pipeline(
-                "gemm_f32_batched_bm64_bn128_coalesced",
-                &shaders::gemm_batched_bm64_bn128_coalesced(),
-                "gemm",
-            )?,
-            gemm_batched_bm96_bn128: gpu.pipeline(
-                "gemm_f32_batched_bm96_bn128",
-                &shaders::gemm_batched_bm96_bn128(),
-                "gemm",
-            )?,
-            gemm_batched_row_bias: gpu.pipeline(
-                "gemm_f32_batched_row_bias",
-                &shaders::gemm_batched_row_bias(shaders::Tile::square(), false),
-                "gemm",
-            )?,
-            gemm_batched_bm64_bn128_row_bias: gpu.pipeline(
-                "gemm_f32_batched_bm64_bn128_row_bias",
-                &shaders::gemm_batched_row_bias(shaders::Tile::bm64_bn128(), false),
-                "gemm",
-            )?,
-            gemm_batched_bm64_bn128_coalesced_row_bias: gpu.pipeline(
-                "gemm_f32_batched_bm64_bn128_coalesced_row_bias",
-                &shaders::gemm_batched_row_bias(shaders::Tile::bm64_bn128(), true),
-                "gemm",
-            )?,
-            gemm_batched_bm96_bn128_row_bias: gpu.pipeline(
-                "gemm_f32_batched_bm96_bn128_row_bias",
-                &shaders::gemm_batched_row_bias(shaders::Tile::bm96_bn128(), false),
-                "gemm",
-            )?,
-            gemm_conv_direct: gpu.pipeline(
-                "gemm_f32_conv_direct",
-                &shaders::gemm_conv_direct(),
-                "gemm",
-            )?,
-            gemm_conv_direct_batched: gpu.pipeline(
-                "gemm_f32_conv_direct_batched",
-                &shaders::gemm_conv_direct_batched(),
-                "gemm",
-            )?,
-            gemm_transb_bn64: gpu.pipeline(
-                "gemm_f32_transb_bn64",
-                &shaders::gemm_transb_bn64(),
-                "gemm",
-            )?,
-            gemm_batched_bn64: gpu.pipeline(
-                "gemm_f32_batched_bn64",
-                &shaders::gemm_batched_bn64(),
-                "gemm",
-            )?,
-            gemm_batched_bn64_row_exp: gpu.pipeline(
-                "gemm_f32_batched_bn64_row_exp",
-                &shaders::gemm_batched_bn64_row_exp(),
-                "gemm",
-            )?,
-            gemm_transb_bm64: gpu.pipeline(
-                "gemm_f32_transb_bm64",
-                &shaders::gemm_transb_bm64(),
-                "gemm",
-            )?,
-            gemm_batched_bm64: gpu.pipeline(
-                "gemm_f32_batched_bm64",
-                &shaders::gemm_batched_bm64(),
-                "gemm",
-            )?,
-            gemm_transb_plain_bias: gpu.pipeline(
-                "gemm_f32_transb_plain_bias",
-                &shaders::gemm_transb_plain_bias(),
-                "gemm",
-            )?,
-            gemm_bias: gpu.pipeline("gemm_f32_bias", &shaders::gemm_bias(), "gemm")?,
-            gemm_gelu_bias: gpu.pipeline(
-                "gemm_f32_gelu_bias",
-                &shaders::gemm_gelu_bias(),
-                "gemm",
-            )?,
-            gemm_residual: gpu.pipeline(
-                "gemm_f32_residual",
-                &shaders::gemm_residual(),
-                "gemm",
-            )?,
-            gemm_bias_residual: gpu.pipeline(
-                "gemm_f32_bias_residual",
-                &shaders::gemm_bias_residual(),
-                "gemm",
-            )?,
-            rms_norm: gpu.pipeline("rms_norm", &shaders::rms_norm(), "rms_norm")?,
-            rms_norm_warp: if gpu.info.shuffle_reduction {
-                Some(gpu.pipeline("rms_norm_warp", &shaders::rms_norm_warp(), "rms_norm")?)
-            } else {
-                None
-            },
-            gelu: gpu.pipeline("gelu", &shaders::gelu(), "gelu")?,
-            gelu_in_place: gpu.pipeline(
-                "gelu_in_place",
-                &shaders::gelu_in_place(),
-                "gelu_in_place",
-            )?,
-            gelu_in_place_vec4: gpu.pipeline(
-                "gelu_in_place_vec4",
-                &shaders::gelu_in_place_vec4(),
-                "gelu_in_place_vec4",
-            )?,
-            glu: gpu.pipeline("glu", &shaders::glu(), "glu")?,
-            glu_channel_affine: gpu.pipeline(
-                "glu_channel_affine",
-                &shaders::glu_channel_affine(),
-                "glu_channel_affine",
-            )?,
-            glu_channel_affine_add: gpu.pipeline(
-                "glu_channel_affine_add",
-                &shaders::glu_channel_affine_add(),
-                "glu_channel_affine_add",
-            )?,
-            sigmoid_gate: gpu.pipeline(
-                "sigmoid_gate",
-                &shaders::sigmoid_gate(),
-                "sigmoid_gate",
-            )?,
-            rope: gpu.pipeline("rope", &shaders::rope(), "rope")?,
-            add_in_place: gpu.pipeline(
-                "add_in_place",
-                &shaders::add_in_place(),
-                "add_in_place",
-            )?,
-            mul_in_place: gpu.pipeline(
-                "mul_in_place",
-                &shaders::mul_in_place(),
-                "mul_in_place",
-            )?,
-            add_in_place_vec4: gpu.pipeline(
-                "add_in_place_vec4",
-                &shaders::add_in_place_vec4(),
-                "add_in_place_vec4",
-            )?,
-            transpose: gpu.pipeline("transpose", &shaders::transpose(), "transpose")?,
-            transpose_wide: gpu.pipeline(
-                "transpose_wide",
-                &shaders::transpose_wide(),
-                "transpose_wide",
-            )?,
-            im2col: gpu.pipeline("im2col", &shaders::im2col(), "im2col")?,
-            fill_zero: gpu.pipeline("fill_zero", &shaders::fill_zero(), "fill_zero")?,
-            crop_rows: gpu.pipeline("crop_rows", &shaders::crop_rows(), "crop_rows")?,
-            copy_pitched: gpu.pipeline(
-                "copy_pitched",
-                &shaders::copy_pitched(),
-                "copy_pitched",
-            )?,
-            group_norm: gpu.pipeline("group_norm", &shaders::group_norm(), "group_norm")?,
-            group_norm_partial: gpu.pipeline(
-                "group_norm_partial",
-                &shaders::group_norm_partial(),
-                "group_norm_partial",
-            )?,
-            group_norm_combine: gpu.pipeline(
-                "group_norm_combine",
-                &shaders::group_norm_combine(),
-                "group_norm_combine",
-            )?,
-            group_norm_apply: gpu.pipeline(
-                "group_norm_apply",
-                &shaders::group_norm_apply(),
-                "group_norm_apply",
-            )?,
-            group_norm_apply_from_partials: gpu.pipeline(
-                "group_norm_apply_from_partials",
-                &shaders::group_norm_apply_from_partials(),
-                "group_norm_apply",
-            )?,
-            lstm_recur: gpu.pipeline("lstm_recur", &shaders::lstm_recur(), "lstm_recur")?,
-            lstm_recur_regs: std::cell::RefCell::new(std::collections::HashMap::new()),
-            heads_permute: gpu.pipeline(
-                "heads_permute",
-                &shaders::heads_permute(),
-                "heads_permute",
-            )?,
-            add_row_bias_in_place: gpu.pipeline(
-                "add_row_bias_in_place",
-                &shaders::add_row_bias_in_place(),
-                "add_row_bias_in_place",
-            )?,
-            channel_affine_act_in_place: gpu.pipeline(
-                "channel_affine_act_in_place",
-                &shaders::channel_affine_act_in_place(),
-                "channel_affine_act_in_place",
-            )?,
-            channel_affine_act_add: gpu.pipeline(
-                "channel_affine_act_add",
-                &shaders::channel_affine_act_add(),
-                "channel_affine_act_add",
-            )?,
-            col2im: gpu.pipeline("col2im", &shaders::col2im(), "col2im")?,
-            col2im_biased: gpu.pipeline("col2im_biased", &shaders::col2im_biased(), "col2im")?,
-            col2im_fixed: std::cell::RefCell::new(std::collections::HashMap::new()),
-            conv_small_oc: std::cell::RefCell::new(std::collections::HashMap::new()),
-            tanh: gpu.pipeline("tanh_activation", &shaders::tanh(), "tanh_activation")?,
-            tanh_bias_in_place: gpu.pipeline(
-                "tanh_bias_in_place",
-                &shaders::tanh_bias_in_place(),
-                "tanh_bias",
-            )?,
-            copy: gpu.pipeline("copy", &shaders::copy(), "copy")?,
-            softmax: gpu.pipeline("softmax", &shaders::softmax(), "softmax")?,
-            softmax_in_place: gpu.pipeline(
-                "softmax_in_place",
-                &shaders::softmax_in_place(),
-                "softmax_in_place",
-            )?,
-            softmax_warp: if gpu.info.shuffle_reduction {
-                Some(gpu.pipeline(
-                    "softmax_in_place_warp",
-                    &shaders::softmax_warp(),
-                    "softmax_in_place",
-                )?)
-            } else {
-                None
-            },
-            softmax_scaled_warp: if gpu.info.shuffle_reduction {
-                Some(gpu.pipeline(
-                    "softmax_scaled_warp",
-                    &shaders::softmax_scaled_warp(),
-                    "softmax",
-                )?)
-            } else {
-                None
-            },
-            softmax_stats_warp: if gpu.info.shuffle_reduction {
-                Some(gpu.pipeline(
-                    "softmax_stats_warp",
-                    &shaders::softmax_stats_warp(),
-                    "softmax_stats",
-                )?)
-            } else {
-                None
-            },
-            softmax_stats_tree: gpu.pipeline(
-                "softmax_stats_tree",
-                &shaders::softmax_stats_tree(),
-                "softmax_stats_tree",
-            )?,
-            flash_attention: gpu.pipeline(
-                "flash_attention",
-                &shaders::flash_attention(),
-                "flash_attention",
-            )?,
-            istft_irfft4096: gpu.pipeline(
-                "istft_irfft4096",
-                &shaders::istft_irfft4096(),
-                "istft_irfft4096",
-            )?,
-            istft_ola: gpu.pipeline("istft_ola", &shaders::istft_ola(), "istft_ola")?,
-            batch_affine_in_place: gpu.pipeline(
-                "batch_affine_in_place",
-                &shaders::batch_affine_in_place(),
-                "batch_affine_in_place",
-            )?,
-            stft_rfft4096: gpu.pipeline(
-                "stft_rfft4096",
-                &shaders::stft_rfft4096(),
-                "stft_rfft4096",
-            )?,
-            batch_moments: gpu.pipeline(
-                "batch_moments",
-                &shaders::batch_moments(),
-                "batch_moments",
-            )?,
-            batch_moments_partial: gpu.pipeline(
-                "batch_moments_partial",
-                &shaders::batch_moments_partial(),
-                "batch_moments_partial",
-            )?,
-            batch_moments_combine: gpu.pipeline(
-                "batch_moments_combine",
-                &shaders::batch_moments_combine(),
-                "batch_moments_combine",
-            )?,
-            batch_normalize_in_place: gpu.pipeline(
-                "batch_normalize_in_place",
-                &shaders::batch_normalize_in_place(),
-                "batch_normalize_in_place",
-            )?,
+            PipeJob::new("gemm_f32_batched_bm64_bn128", shaders::gemm_batched_bm64_bn128(), "gemm"),
+            PipeJob::new("gemm_f32_batched_bm64_bn128_coalesced", shaders::gemm_batched_bm64_bn128_coalesced(), "gemm"),
+            PipeJob::new("gemm_f32_batched_bm96_bn128", shaders::gemm_batched_bm96_bn128(), "gemm"),
+            PipeJob::new("gemm_f32_batched_row_bias", shaders::gemm_batched_row_bias(shaders::Tile::square(), false), "gemm"),
+            PipeJob::new("gemm_f32_batched_bm64_bn128_row_bias", shaders::gemm_batched_row_bias(shaders::Tile::bm64_bn128(), false), "gemm"),
+            PipeJob::new("gemm_f32_batched_bm64_bn128_coalesced_row_bias", shaders::gemm_batched_row_bias(shaders::Tile::bm64_bn128(), true), "gemm"),
+            PipeJob::new("gemm_f32_batched_bm96_bn128_row_bias", shaders::gemm_batched_row_bias(shaders::Tile::bm96_bn128(), false), "gemm"),
+            PipeJob::new("gemm_f32_conv_direct", shaders::gemm_conv_direct(), "gemm"),
+            PipeJob::new("gemm_f32_conv_direct_batched", shaders::gemm_conv_direct_batched(), "gemm"),
+            PipeJob::new("gemm_f32_transb_bn64", shaders::gemm_transb_bn64(), "gemm"),
+            PipeJob::new("gemm_f32_batched_bn64", shaders::gemm_batched_bn64(), "gemm"),
+            PipeJob::new("gemm_f32_batched_bn64_row_exp", shaders::gemm_batched_bn64_row_exp(), "gemm"),
+            PipeJob::new("gemm_f32_transb_bm64", shaders::gemm_transb_bm64(), "gemm"),
+            PipeJob::new("gemm_f32_batched_bm64", shaders::gemm_batched_bm64(), "gemm"),
+            PipeJob::new("gemm_f32_transb_plain_bias", shaders::gemm_transb_plain_bias(), "gemm"),
+            PipeJob::new("gemm_f32_bias", shaders::gemm_bias(), "gemm"),
+            PipeJob::new("gemm_f32_gelu_bias", shaders::gemm_gelu_bias(), "gemm"),
+            PipeJob::new("gemm_f32_residual", shaders::gemm_residual(), "gemm"),
+            PipeJob::new("gemm_f32_bias_residual", shaders::gemm_bias_residual(), "gemm"),
+            PipeJob::new("rms_norm", shaders::rms_norm(), "rms_norm"),
+            PipeJob::new("gelu", shaders::gelu(), "gelu"),
+            PipeJob::new("gelu_in_place", shaders::gelu_in_place(), "gelu_in_place"),
+            PipeJob::new("gelu_in_place_vec4", shaders::gelu_in_place_vec4(), "gelu_in_place_vec4"),
+            PipeJob::new("glu", shaders::glu(), "glu"),
+            PipeJob::new("glu_channel_affine", shaders::glu_channel_affine(), "glu_channel_affine"),
+            PipeJob::new("glu_channel_affine_add", shaders::glu_channel_affine_add(), "glu_channel_affine_add"),
+            PipeJob::new("sigmoid_gate", shaders::sigmoid_gate(), "sigmoid_gate"),
+            PipeJob::new("rope", shaders::rope(), "rope"),
+            PipeJob::new("add_in_place", shaders::add_in_place(), "add_in_place"),
+            PipeJob::new("mul_in_place", shaders::mul_in_place(), "mul_in_place"),
+            PipeJob::new("add_in_place_vec4", shaders::add_in_place_vec4(), "add_in_place_vec4"),
+            PipeJob::new("transpose", shaders::transpose(), "transpose"),
+            PipeJob::new("transpose_wide", shaders::transpose_wide(), "transpose_wide"),
+            PipeJob::new("im2col", shaders::im2col(), "im2col"),
+            PipeJob::new("fill_zero", shaders::fill_zero(), "fill_zero"),
+            PipeJob::new("crop_rows", shaders::crop_rows(), "crop_rows"),
+            PipeJob::new("copy_pitched", shaders::copy_pitched(), "copy_pitched"),
+            PipeJob::new("group_norm", shaders::group_norm(), "group_norm"),
+            PipeJob::new("group_norm_partial", shaders::group_norm_partial(), "group_norm_partial"),
+            PipeJob::new("group_norm_combine", shaders::group_norm_combine(), "group_norm_combine"),
+            PipeJob::new("group_norm_apply", shaders::group_norm_apply(), "group_norm_apply"),
+            PipeJob::new("group_norm_apply_from_partials", shaders::group_norm_apply_from_partials(), "group_norm_apply"),
+            PipeJob::new("lstm_recur", shaders::lstm_recur(), "lstm_recur"),
+            PipeJob::new("add_row_bias_in_place", shaders::add_row_bias_in_place(), "add_row_bias_in_place"),
+            PipeJob::new("channel_affine_act_in_place", shaders::channel_affine_act_in_place(), "channel_affine_act_in_place"),
+            PipeJob::new("channel_affine_act_add", shaders::channel_affine_act_add(), "channel_affine_act_add"),
+            PipeJob::new("col2im", shaders::col2im(), "col2im"),
+            PipeJob::new("col2im_biased", shaders::col2im_biased(), "col2im"),
+            PipeJob::new("tanh_bias_in_place", shaders::tanh_bias_in_place(), "tanh_bias"),
+            PipeJob::new("copy", shaders::copy(), "copy"),
+            PipeJob::new("softmax", shaders::softmax(), "softmax"),
+            PipeJob::new("softmax_in_place", shaders::softmax_in_place(), "softmax_in_place"),
+            PipeJob::new("softmax_stats_tree", shaders::softmax_stats_tree(), "softmax_stats_tree"),
+            PipeJob::new("flash_attention", shaders::flash_attention(), "flash_attention"),
+            PipeJob::new("istft_irfft4096", shaders::istft_irfft4096(), "istft_irfft4096"),
+            PipeJob::new("istft_ola", shaders::istft_ola(), "istft_ola"),
+            PipeJob::new("batch_affine_in_place", shaders::batch_affine_in_place(), "batch_affine_in_place"),
+            PipeJob::new("stft_rfft4096", shaders::stft_rfft4096(), "stft_rfft4096"),
+            PipeJob::new("batch_moments", shaders::batch_moments(), "batch_moments"),
+            PipeJob::new("batch_moments_partial", shaders::batch_moments_partial(), "batch_moments_partial"),
+            PipeJob::new("batch_moments_combine", shaders::batch_moments_combine(), "batch_moments_combine"),
+            PipeJob::new("batch_normalize_in_place", shaders::batch_normalize_in_place(), "batch_normalize_in_place"),
+        ];
+        let mut built = gpu.pipelines(&jobs)?;
+        let mut take = |name: &str| {
+            built
+                .remove(name)
+                .ok_or_else(|| Error::Gpu(format!("pipeline {name} was not built")))
+        };
+        Ok(Self {
+            gemm: take("gemm_f32")?,
+            gemm_batched: take("gemm_f32_batched")?,
+            gemm_transb: take("gemm_f32_transb")?,
+            gemm_transb_plain: take("gemm_f32_transb_plain")?,
+            gemm_bm64: take("gemm_f32_bm64")?,
+            gemm_bm64_coalesced: take("gemm_f32_bm64_coalesced")?,
+            gemm_batched_bm64_bn128: take("gemm_f32_batched_bm64_bn128")?,
+            gemm_batched_bm64_bn128_coalesced: take("gemm_f32_batched_bm64_bn128_coalesced")?,
+            gemm_batched_bm96_bn128: take("gemm_f32_batched_bm96_bn128")?,
+            gemm_batched_row_bias: take("gemm_f32_batched_row_bias")?,
+            gemm_batched_bm64_bn128_row_bias: take("gemm_f32_batched_bm64_bn128_row_bias")?,
+            gemm_batched_bm64_bn128_coalesced_row_bias: take("gemm_f32_batched_bm64_bn128_coalesced_row_bias")?,
+            gemm_batched_bm96_bn128_row_bias: take("gemm_f32_batched_bm96_bn128_row_bias")?,
+            gemm_conv_direct: take("gemm_f32_conv_direct")?,
+            gemm_conv_direct_batched: take("gemm_f32_conv_direct_batched")?,
+            gemm_transb_bn64: take("gemm_f32_transb_bn64")?,
+            gemm_batched_bn64: take("gemm_f32_batched_bn64")?,
+            gemm_batched_bn64_row_exp: take("gemm_f32_batched_bn64_row_exp")?,
+            gemm_transb_bm64: take("gemm_f32_transb_bm64")?,
+            gemm_batched_bm64: take("gemm_f32_batched_bm64")?,
+            gemm_transb_plain_bias: take("gemm_f32_transb_plain_bias")?,
+            gemm_bias: take("gemm_f32_bias")?,
+            gemm_gelu_bias: take("gemm_f32_gelu_bias")?,
+            gemm_residual: take("gemm_f32_residual")?,
+            gemm_bias_residual: take("gemm_f32_bias_residual")?,
+            rms_norm: take("rms_norm")?,
+            rms_norm_warp: if gpu.info.shuffle_reduction { Some(gpu.pipeline("rms_norm_warp", &shaders::rms_norm_warp(), "rms_norm")?) } else { None },
+            gelu: take("gelu")?,
+            gelu_in_place: take("gelu_in_place")?,
+            gelu_in_place_vec4: take("gelu_in_place_vec4")?,
+            glu: take("glu")?,
+            glu_channel_affine: take("glu_channel_affine")?,
+            glu_channel_affine_add: take("glu_channel_affine_add")?,
+            sigmoid_gate: take("sigmoid_gate")?,
+            rope: take("rope")?,
+            add_in_place: take("add_in_place")?,
+            mul_in_place: take("mul_in_place")?,
+            add_in_place_vec4: take("add_in_place_vec4")?,
+            transpose: take("transpose")?,
+            transpose_wide: take("transpose_wide")?,
+            im2col: take("im2col")?,
+            fill_zero: take("fill_zero")?,
+            crop_rows: take("crop_rows")?,
+            copy_pitched: take("copy_pitched")?,
+            group_norm: take("group_norm")?,
+            group_norm_partial: take("group_norm_partial")?,
+            group_norm_combine: take("group_norm_combine")?,
+            group_norm_apply: take("group_norm_apply")?,
+            group_norm_apply_from_partials: take("group_norm_apply_from_partials")?,
+            lstm_recur: take("lstm_recur")?,
+            lstm_recur_regs: std::cell::RefCell::new(std::collections::HashMap::new()), heads_permute: gpu.pipeline( "heads_permute", &shaders::heads_permute(), "heads_permute")?,
+            add_row_bias_in_place: take("add_row_bias_in_place")?,
+            channel_affine_act_in_place: take("channel_affine_act_in_place")?,
+            channel_affine_act_add: take("channel_affine_act_add")?,
+            col2im: take("col2im")?,
+            col2im_biased: take("col2im_biased")?,
+            col2im_fixed: std::cell::RefCell::new(std::collections::HashMap::new()), conv_small_oc: std::cell::RefCell::new(std::collections::HashMap::new()), tanh: gpu.pipeline("tanh_activation", &shaders::tanh(), "tanh_activation")?,
+            tanh_bias_in_place: take("tanh_bias_in_place")?,
+            copy: take("copy")?,
+            softmax: take("softmax")?,
+            softmax_in_place: take("softmax_in_place")?,
+            softmax_warp: if gpu.info.shuffle_reduction { Some(gpu.pipeline( "softmax_in_place_warp", &shaders::softmax_warp(), "softmax_in_place")?) } else { None },
+            softmax_scaled_warp: if gpu.info.shuffle_reduction { Some(gpu.pipeline( "softmax_scaled_warp", &shaders::softmax_scaled_warp(), "softmax")?) } else { None },
+            softmax_stats_warp: if gpu.info.shuffle_reduction { Some(gpu.pipeline( "softmax_stats_warp", &shaders::softmax_stats_warp(), "softmax_stats")?) } else { None },
+            softmax_stats_tree: take("softmax_stats_tree")?,
+            flash_attention: take("flash_attention")?,
+            istft_irfft4096: take("istft_irfft4096")?,
+            istft_ola: take("istft_ola")?,
+            batch_affine_in_place: take("batch_affine_in_place")?,
+            stft_rfft4096: take("stft_rfft4096")?,
+            batch_moments: take("batch_moments")?,
+            batch_moments_partial: take("batch_moments_partial")?,
+            batch_moments_combine: take("batch_moments_combine")?,
+            batch_normalize_in_place: take("batch_normalize_in_place")?,
         })
     }
 

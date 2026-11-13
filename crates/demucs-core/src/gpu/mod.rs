@@ -572,25 +572,111 @@ impl Gpu {
         wgsl: &str,
         entry: &str,
     ) -> Result<wgpu::ComputePipeline> {
-        let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: None,
-                module: &module,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        if let Some(error) = pollster::block_on(guard.pop()) {
-            return Err(Error::Gpu(format!("pipeline {label} failed validation: {error}")));
+        build_pipeline(&self.device, label, wgsl, entry)
+    }
+
+    /// Build a batch of compute pipelines across every core, keyed by label.
+    ///
+    /// Every job is independent — same device, no shared bind group — and the
+    /// expensive part (naga → HLSL/SPIR-V plus the driver's own compiler) runs
+    /// on the calling thread and holds no lock. So this is the one load stage
+    /// that scales with cores.
+    ///
+    /// Only `wgpu::Device` is shared with the workers: `Gpu` itself carries
+    /// `Cell`/`RefCell` staging state and is deliberately not `Sync`, and the
+    /// builders below need nothing else from it.
+    ///
+    /// Measured on the sibling ASR port (same machine, 24 shaders): 6.4 s one
+    /// at a time, 1.15 s across the pool. [`crate::gpu::kernels::Kernels`] is
+    /// 71 pipelines built through here in one go.
+    ///
+    /// The error names the pipeline it belongs to, so a bad shader reads like
+    /// the sequential version.
+    pub fn pipelines(
+        &self,
+        jobs: &[PipeJob<'_>],
+    ) -> Result<std::collections::HashMap<String, wgpu::ComputePipeline>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        if jobs.is_empty() {
+            return Ok(std::collections::HashMap::new());
         }
-        Ok(pipeline)
+        let device = self.device.clone();
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(jobs.len());
+        let next = AtomicUsize::new(0);
+        let slots: Vec<std::sync::OnceLock<Result<wgpu::ComputePipeline>>> =
+            (0..jobs.len()).map(|_| std::sync::OnceLock::new()).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(i) else { break };
+                    let _ = slots[i].set(build_pipeline(&device, job.label, &job.wgsl, job.entry));
+                });
+            }
+        });
+        let mut out = std::collections::HashMap::with_capacity(jobs.len());
+        for (slot, job) in slots.into_iter().zip(jobs) {
+            let pipeline = slot.into_inner().expect("every job is picked up by a worker")?;
+            if out.insert(job.label.to_string(), pipeline).is_some() {
+                return Err(Error::Gpu(format!(
+                    "duplicate pipeline label {:?}",
+                    job.label
+                )));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Build one compute pipeline on `device`.
+///
+/// 自由函数而不是方法：[`Gpu::pipelines`] 要把构建铺到多个线程上，而 `Gpu` 带
+/// `Cell`/`RefCell`、不是 `Sync` —— 能安全共享的只有 `wgpu::Device`。
+fn build_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    wgsl: &str,
+    entry: &str,
+) -> Result<wgpu::ComputePipeline> {
+    let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: None,
+        module: &module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    if let Some(error) = pollster::block_on(guard.pop()) {
+        return Err(Error::Gpu(format!("pipeline {label} failed validation: {error}")));
+    }
+    Ok(pipeline)
+}
+
+/// One compute pipeline for [`Gpu::pipelines`].
+///
+/// WGSL 是 owned 的：shader 生成器每次返回新的 `String`，而这批作业比生成它的
+/// 表达式活得久。
+pub struct PipeJob<'a> {
+    pub label: &'a str,
+    pub wgsl: String,
+    pub entry: &'a str,
+}
+
+impl<'a> PipeJob<'a> {
+    pub fn new(label: &'a str, wgsl: String, entry: &'a str) -> Self {
+        Self {
+            label,
+            wgsl,
+            entry,
+        }
     }
 }
 
